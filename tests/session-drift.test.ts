@@ -62,9 +62,21 @@ test("main path + needsRebuild: rebuilds in place with full history", () => {
   expect(T.getSharedSession()).toEqual({ sessionId: "66666666-6666-4666-8666-666666666666", cursor: 2, cwd });
 });
 
-test("reentrant with no shared session yet: rebuilds its own (Case 2), does not preserve", () => {
+test("reentrant with no shared session yet: still a clean start, never publishes its own", () => {
   T.resetSharedSession();
   const r = T.syncSharedSession([u("a"), a("b"), u("c")], cwd, undefined, "claude-sonnet-5", true);
-  expect(r.sessionId).toBeTruthy();
-  expect(r.preserveSharedSession).toBeUndefined();
+  expect(r.sessionId).toBeNull();
+  expect(r.preserveSharedSession).toBe(true);
+  // A subagent's history must not become the main conversation's session.
+  expect(T.getSharedSession()).toBeNull();
+});
+
+test("reentrant never reuses the parent session, even when its history lines up", () => {
+  T.resetSharedSession();
+  T.setSharedSession({ sessionId: "77777777-7777-4777-8777-777777777777", cursor: 2, cwd });
+  // priors (2) >= cursor (2): this is exactly what the REUSE path accepts.
+  const r = T.syncSharedSession([u("a"), a("b"), u("c")], cwd, undefined, "claude-sonnet-5", true);
+  expect(r.sessionId).toBeNull();
+  expect(r.preserveSharedSession).toBe(true);
+  expect(T.getSharedSession()).toMatchObject({ sessionId: "77777777-7777-4777-8777-777777777777", cursor: 2 });
 });

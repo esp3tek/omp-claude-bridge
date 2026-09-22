@@ -66,6 +66,26 @@ Verified against omp 18.2.8 and Claude Code 2.1.278 on Windows.
   `CLAUDE_BRIDGE_DEBUG_MAX_MB`) so debug logging can stay on permanently.
 - Safeguard refusals are named, with what actually fixes them, instead of being retried blindly.
 
+### Review follow-ups
+
+Findings from an independent review of this release, fixed here:
+
+- **A subagent could take over the main session.** `syncSharedSession` decided REUSE before it
+  checked for a reentrant call, so a child whose history happened to line up with the parent's
+  cursor was handed the parent's session id; a child rebuilding while no shared session existed
+  published its own as the main one; and a child's tool results moved the shared cursor (40 to 3
+  in the reproduction). Reentrancy is now decided first, and a reentrant call never reuses,
+  rebuilds, publishes or advances the shared session.
+- **A safeguard refusal is no longer retried on another model.** Re-sending a refused request
+  until one model's safeguards accept it works around a protective measure rather than fixing the
+  input; the refusal is now terminal, with a message saying what to change.
+- **Rate-limit warnings showed the wrong reset time** (`resetsAt` is epoch seconds, handed to
+  `Date` as milliseconds) and fired at 79.6% against an 80% threshold because the value was
+  rounded before the comparison.
+- Documentation corrected where it overstated the boundary: the Claude Code subprocess inherits
+  this process's environment, debug logs are not redacted, and the scope is personal use with
+  your own subscription.
+
 ### Notes
 - Compaction with omp's `snapcompact` method injects an archive whose preamble describes
   reconstructing a verbatim transcript including the assistant's reasoning. Opus 5 refuses the

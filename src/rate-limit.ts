@@ -20,13 +20,18 @@ export function rateLimitNotice(
 	threshold: number = RATE_LIMIT_WARN_THRESHOLD,
 ): RateLimitNotice | null {
 	if (info?.status === "rejected") {
-		const resetsAt = info.resetsAt ? new Date(info.resetsAt).toLocaleTimeString() : "unknown";
+		// resetsAt is epoch SECONDS; handing it straight to Date reads it as
+		// milliseconds and shows a time decades off.
+		const ms = resetsAtToMs(info.resetsAt);
+		const resetsAt = ms !== undefined ? new Date(ms).toLocaleTimeString() : "unknown";
 		return { message: `Claude rate limited (${info.rateLimitType ?? "unknown"}) — resets at ${resetsAt}`, level: "warning" };
 	}
 	if (info?.status === "allowed_warning") {
-		const utilization = Math.round(info.utilization ?? 0);
+		// Compare the real value, round only for display: 79.6% is below an 80%
+		// threshold, however it prints.
+		const utilization = info.utilization ?? 0;
 		if (utilization >= threshold) {
-			return { message: `Claude rate limit warning: ${utilization}% used (${info.rateLimitType ?? ""})`, level: "warning" };
+			return { message: `Claude rate limit warning: ${Math.round(utilization)}% used (${info.rateLimitType ?? ""})`, level: "warning" };
 		}
 	}
 	return null;

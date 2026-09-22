@@ -444,10 +444,14 @@ async function runIsolatedSummary(
 				stream.end();
 				return;
 			}
-			if (err instanceof SummaryRefusedError && i + 1 < candidates.length) {
-				debug(`compact summary: ${candidates[i]} refused (${err.message.slice(0, 120)}); retrying with ${candidates[i + 1]}`);
-				piUI?.notify(`Claude bridge: summary refused by ${candidates[i]}, retrying with ${candidates[i + 1]}`, "warning");
-				continue;
+			if (err instanceof SummaryRefusedError) {
+				// Terminal on purpose. Re-sending a refused request to a model whose
+				// safeguards happen to accept it is working around a protective
+				// measure, not fixing the input. Surface it and let the caller change
+				// what is being asked.
+				debug(`compact summary: ${candidates[i]} refused (${err.message.slice(0, 160)}); not retrying on another model`);
+				piUI?.notify(`Claude bridge: ${candidates[i]} declined to summarize this conversation. Compact from another model, or reduce what is being summarized.`, "error");
+				break;
 			}
 			break;
 		}
@@ -648,6 +652,19 @@ function syncSharedSession(
 ): SyncResult {
 	const priorMessages = messages.slice(0, -1); // everything before the new user prompt
 
+	// A reentrant call (subagent, side query) is decided first, before REUSE can
+	// hand it the parent's session id. It gets a throwaway clean start and never
+	// touches the shared session: not its id, not its file, not its cursor. A
+	// child's own history must not become the main conversation's either, so
+	// this holds even when no shared session exists yet. The child keeps its
+	// context through its live query (tool results come back on the same
+	// query), so it loses nothing by not resuming.
+	if (isReentrant) {
+		debug(`Case 1 synthetic: reentrant context, clean start${sharedSession ? `, preserving shared session ${sharedSession.sessionId.slice(0, 8)} (cursor=${sharedSession.cursor})` : ", no shared session yet"}`);
+		debug(`syncResult: path=clean-start preserve-shared reentrant priors=${priorMessages.length}`);
+		return { sessionId: null, preserveSharedSession: true };
+	}
+
 	// REUSE path
 	//
 	// Guard on priorMessages.length >= cursor: a shorter incoming context cannot
@@ -678,15 +695,6 @@ function syncSharedSession(
 	//     would run Claude Code without --resume, i.e. with NO history at all
 	//     (upstream pi-claude-bridge issues #55 and #62). Fall through to
 	//     REBUILD instead: costs a cache rewrite, never loses the conversation.
-	// A reentrant call (subagent / side query) whose history is out of sync
-	// with the shared session must never reach REBUILD: that would
-	// deleteSession + createSession the parent's UUID while the parent's
-	// Claude Code process is still writing to it. Regardless of needsRebuild.
-	if (isReentrant && sharedSession) {
-		debug(`Case 1 synthetic: reentrant context out of sync (needsRebuild=${!!sharedSession.needsRebuild}, priors=${priorMessages.length}, cursor=${sharedSession.cursor}); clean start, preserving shared session ${sharedSession.sessionId.slice(0, 8)}`);
-		debug(`syncResult: path=clean-start preserve-shared sessionId=${sharedSession.sessionId} cursor=${sharedSession.cursor}`);
-		return { sessionId: null, preserveSharedSession: true };
-	}
 	if (sharedSession && !sharedSession.needsRebuild && priorMessages.length < sharedSession.cursor) {
 		// Zero priors is never the main conversation once cursor >= 1 (/new
 		// clears the session via session_start): it is a one-shot side request
@@ -1487,7 +1495,11 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		const steer = lastMsgRole === "user" ? steerBlocks(context.messages) : null;
 		void deliverToolResults(resultCtx, allResults, steer, context.messages.length);
 
-		if (sharedSession) sharedSession.cursor = context.messages.length;
+		// Only the main conversation's tool results advance the shared cursor: a
+		// subagent's context is shorter, and letting it write here dragged the
+		// cursor backwards (40 -> 3 in a reproduction), so the parent's next turn
+		// resumed a session that no longer matched its history.
+		if (sharedSession && resultCtx === ctx()) sharedSession.cursor = context.messages.length;
 		resultCtx.latestCursor = Math.max(resultCtx.latestCursor, context.messages.length);
 		return stream;
 	}
@@ -1498,7 +1510,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	const lastMsg = context.messages[context.messages.length - 1];
 	if (lastMsg?.role === "toolResult") {
 		debug(`provider: orphaned tool result after abort, emitting end_turn`);
-		if (sharedSession) sharedSession.cursor = context.messages.length;
+		if (sharedSession) sharedSession.cursor = Math.max(sharedSession.cursor, context.messages.length);
 		const c = ctx();  // capture current context for the microtask
 		queueMicrotask(() => {
 			c.resetTurnState(model);

@@ -66,8 +66,8 @@ Upstream's omp port has not been updated since July 2026, so the fixes below liv
   uncompacted. Declining hands the summary to omp's normal provider path, which has no deadline.
   Still available with `provider.compactTakeover: true`.
 - **The next Claude Code process is pre-warmed** between turns (measured: ~1.5 s less per message).
-- **Claude subscription quota reaches omp** (`omp usage`, the status bar, `retry.usageAwareFallback`)
-  by reading Claude Code's own OAuth token.
+- **Claude subscription quota reaches omp** (the status bar, `retry.usageAwareFallback`), built from
+  the rate-limit events the SDK reports during a turn — no credential is read (see below).
 - **The model list comes from Claude Code's picker** (`supportedModels()`), so a model the installed
   binary and plan actually serve shows up without a code change; the static list is the fallback.
   Adds Claude Fable 5.1 and Opus 5.
@@ -91,14 +91,24 @@ drawn in the code rather than in a promise:
 - **Every request to Anthropic is made by Claude Code**, spawned through the official
   [`@anthropic-ai/claude-agent-sdk`](https://github.com/anthropics/claude-agent-sdk-typescript).
   Authentication, billing and quota are Claude Code's, exactly as if you had typed into it.
-- **The extension never reads, stores, forwards or inspects a credential.** It does not open
-  `.credentials.json`, sets no `Authorization` header, and makes no network request of its own —
-  there is no `fetch` in the source outside the SDK. Quota reporting is built from the
+- **The extension does not read, store or inspect a credential of its own.** It never opens
+  `.credentials.json`, sets no `Authorization` header, and makes no network request outside the
+  SDK — there is no `fetch` anywhere in `src/`. Quota reporting is built from the
   `rate_limit_event` messages the SDK already delivers during a turn (see `src/usage.ts`).
+  The one caveat worth stating plainly: the Claude Code subprocess **inherits this process's
+  environment**, so if you have `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN` set, Claude Code
+  receives them like any other child process would — the bridge neither reads their values nor
+  adds them, but it does not strip them either, and it warns when they are present.
 - **It warns instead of going along with a redirect.** `ANTHROPIC_BASE_URL`,
   `ANTHROPIC_AUTH_TOKEN` and `ANTHROPIC_API_KEY` in your environment are inherited by the child
   and change where its requests go or what pays for them; the bridge says so once per session
   rather than letting subscription traffic quietly leave Anthropic.
+
+**Scope.** This is meant for running Claude Code yourself, with your own subscription, from your
+own machine. Anthropic's SDK documentation separately restricts *offering* claude.ai
+authentication or subscription limits as part of a product to other people without prior
+approval; nothing here is built for that, and putting it behind a service for others would be a
+different question that this README does not answer for you.
 
 What it does do is shape the session Claude Code works from: it writes omp's conversation into a
 Claude Code session file under `~/.claude/projects/<project>/<uuid>.jsonl` and resumes it, serves
@@ -109,9 +119,17 @@ One consequence of staying inside the SDK: a quota window is unknown until a tur
 it, so a session shows no Claude quota until its first turn finishes, and `omp usage` run as a
 standalone command — a fresh process that never takes a turn — shows none at all.
 
-With `CLAUDE_BRIDGE_DEBUG=1` the logs under `~/.omp/agent/` hold the first 60 characters of each
-prompt and truncated tool results: your work, on your disk, pruned automatically, never sent
-anywhere.
+### Debug logging
+
+`CLAUDE_BRIDGE_DEBUG=1` is verbose on purpose, and worth understanding before leaving it on:
+`~/.omp/agent/claude-bridge.log` records the first 60 characters of each prompt, truncated tool
+results, and Claude Code's stderr; `cc-cli-logs/` holds Claude Code's own debug stream per query;
+`claude-bridge-sysprompt.txt` and `claude-bridge-tools.json` hold omp's full system prompt and
+tool descriptions as captured on the last turn. **None of it is redacted.** A secret that appears
+in a prompt, a file you read, or a tool's output can therefore end up in those files. They stay on
+your machine and are pruned at startup (`CLAUDE_BRIDGE_DEBUG_KEEP_DAYS`, default 7;
+`CLAUDE_BRIDGE_DEBUG_MAX_MB`, default 20 — a size cap applied at startup, not continuously), but
+if you work with secrets in context, leave debug off or delete the directory afterwards.
 ## Table of contents
 
 - [Features](#features)
