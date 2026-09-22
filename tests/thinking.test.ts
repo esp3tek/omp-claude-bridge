@@ -27,3 +27,18 @@ test("dropping thinking never empties an assistant message", () => {
   const r = convertPiMessages([user("a"), asst("1"), user("b"), asst("2")], undefined, "none");
   for (const m of r.anthropicMessages) if (m.role === "assistant") expect((m.content as any[]).length).toBeGreaterThan(0);
 });
+
+import { sanitizeToolId } from "../src/convert.ts";
+
+test("sanitizing tool ids never maps two different ids onto one", () => {
+  const cache = new Map<string, string>();
+  expect(sanitizeToolId("call.a", cache)).toBe("call_a");
+  expect(sanitizeToolId("call/a", cache)).toBe("call_a_2");
+  expect(sanitizeToolId("call.a", cache)).toBe("call_a"); // stable per id
+  expect(new Set(cache.values()).size).toBe(cache.size);
+});
+
+test("an id that needs no substitution is passed through", () => {
+  const cache = new Map<string, string>();
+  expect(sanitizeToolId("toolu_01ABC-def", cache)).toBe("toolu_01ABC-def");
+});

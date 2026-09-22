@@ -12,6 +12,8 @@ bun test tests/*.test.ts
 | `session-drift.test.ts` | `syncSharedSession`: a shorter main-thread context rebuilds instead of starting clean; reentrant calls never rebuild or adopt the shared session; zero-prior side requests preserve it |
 | `thinking.test.ts` | `provider.replayThinking` — which historical `thinking` blocks reach a rebuilt session |
 | `pack.test.ts` | Condensing omp's real tool descriptions (`fixtures-omp-tools.json`) under Claude Code's 2048-character limit while keeping `<critical>` and the examples |
+| `prompt-stream.test.ts` | The stdin generator: acks resolve on delivery, and abandoning the consumer settles every queued push instead of leaving it pending |
+| `usage.test.ts` | Quota from SDK rate-limit events: `unifiedWindows` fractions, the documented percentage fallback, stale windows, values on an unknown scale |
 | `claude-models.test.ts` | Collapsing Claude Code's picker entries into base model ids and 1M capability |
 
 ## Integration (`node`, drives omp over its RPC protocol — spends quota)

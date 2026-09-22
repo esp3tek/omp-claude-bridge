@@ -1326,19 +1326,49 @@ interface WarmProcess {
 	timer: ReturnType<typeof setTimeout>;
 }
 let warmProcess: WarmProcess | null = null;
+// Bumped by every discard. A startup() still in flight when that happens
+// belongs to a superseded generation: its handle is closed on arrival instead
+// of being published, which is otherwise how a process discarded on shutdown
+// or rebuild comes back to life a second later.
+let warmGeneration = 0;
 const WARM_TTL_MS = 10 * 60_000;
 
-function warmKey(opts: Record<string, unknown>, mcpToolNames: string[]): string {
+// A stable digest of a string. Not cryptographic: it only has to change when
+// the string does, and a prompt's length plus its first 80 characters does not
+// (omp's host-prompt header alone is longer than that, and two prompts of the
+// same length would collide).
+function digest(value: string): string {
+	let h1 = 0x811c9dc5;
+	let h2 = 0x01000193;
+	for (let i = 0; i < value.length; i++) {
+		const c = value.charCodeAt(i);
+		h1 = Math.imul(h1 ^ c, 0x01000193);
+		h2 = Math.imul(h2 + c, 0x85ebca6b) ^ (h2 >>> 13);
+	}
+	return `${value.length}:${(h1 >>> 0).toString(36)}${(h2 >>> 0).toString(36)}`;
+}
+
+// Everything the warm process baked in at startup. A tool whose description or
+// schema changed between turns is a different tool set even under the same
+// name, so the definitions go in, not just the names.
+function warmKey(opts: Record<string, unknown>, mcpTools: Tool[]): string {
 	const extra = (opts.extraArgs ?? {}) as Record<string, unknown>;
 	const sys = opts.systemPrompt;
-	const sysKey = typeof sys === "string" ? `s${sys.length}:${sys.slice(0, 80)}` : JSON.stringify(sys);
 	return JSON.stringify({
-		model: extra.model, effort: opts.effort ?? null, resume: opts.resume ?? null, cwd: opts.cwd,
-		settings: opts.settingSources ?? null, tools: mcpToolNames, sys: sysKey,
+		model: extra.model,
+		extraArgs: extra,
+		effort: opts.effort ?? null,
+		resume: opts.resume ?? null,
+		cwd: opts.cwd,
+		settings: opts.settingSources ?? null,
+		env: digest(JSON.stringify(opts.env ?? null)),
+		sys: digest(typeof sys === "string" ? sys : JSON.stringify(sys ?? null)),
+		tools: digest(JSON.stringify(mcpTools.map((t) => [t.name, t.description, t.parameters]))),
 	});
 }
 
 function discardWarm(reason: string): void {
+	warmGeneration++;
 	if (!warmProcess) return;
 	debug(`prewarm: discarding (${reason}), age=${Math.round((Date.now() - warmProcess.createdAt) / 1000)}s`);
 	clearTimeout(warmProcess.timer);
@@ -1349,13 +1379,19 @@ function discardWarm(reason: string): void {
 /** Spawn the next process in the background. `opts` is the options object the
  *  next fresh query would build; the caller passes fresh mcpServers bound to
  *  the top-level QueryContext. Never throws: a failed warm-up costs nothing. */
-function scheduleWarm(opts: Record<string, unknown>, mcpToolNames: string[]): void {
+function scheduleWarm(opts: Record<string, unknown>, mcpTools: Tool[]): void {
 	if (providerSettings.prewarm === false) return;
 	discardWarm("replaced");
-	const key = warmKey(opts, mcpToolNames);
+	const key = warmKey(opts, mcpTools);
 	const startedAt = Date.now();
+	const generation = warmGeneration;
 	startup({ options: { ...(opts as object), ...makeCliDebugOptions("prewarm") } as any, initializeTimeoutMs: 30_000 })
 		.then((handle) => {
+			if (generation !== warmGeneration) {
+				debug(`prewarm: ready but its generation was discarded; closing`);
+				try { handle.close(); } catch { /* ignore */ }
+				return;
+			}
 			if (warmProcess) { try { handle.close(); } catch { /* ignore */ } return; }
 			const timer = setTimeout(() => discardWarm("ttl"), WARM_TTL_MS);
 			warmProcess = { handle, key, createdAt: Date.now(), timer };
@@ -1667,7 +1703,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 
 	// 3. Start SDK query and claim it for this context
 	let wasAborted = false;
-	const warm = isReentrant ? null : takeWarm(warmKey(queryOptions as Record<string, unknown>, mcpTools.map((t) => t.name)));
+	const warm = isReentrant ? null : takeWarm(warmKey(queryOptions as Record<string, unknown>, mcpTools));
 	const sdkQuery = warm ? warm.query(prompt) : query({ prompt, options: queryOptions });
 	queryCtx.activeQuery = sdkQuery;
 	activeQueryContexts.add(queryCtx);
@@ -1752,7 +1788,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 					resume: sharedSession.sessionId,
 					mcpServers: buildMcpServers(mcpTools, ctx(), forwardHostPrompt),
 				};
-				scheduleWarm(nextOptions as Record<string, unknown>, mcpTools.map((t) => t.name));
+				scheduleWarm(nextOptions as Record<string, unknown>, mcpTools);
 			}
 		})
 		.catch((error) => {
@@ -1826,16 +1862,16 @@ async function promptAndWait(
 	// provider call will see missed messages and trigger a Case 4 rebuild.
 	let resumeSessionId: string | null = null;
 	if (!options?.isolated && options?.context?.length) {
-		if (sharedSession) {
-			// Provider already has a session — just resume from it
-			// Any missed messages from other providers were already handled by the provider's Case 4
-			resumeSessionId = sharedSession.sessionId;
-		} else {
-			// No provider session yet — create one from pi's context
-			const contextWithPrompt = [...options.context, { role: "user" as const, content: prompt, timestamp: Date.now() }];
-			const sync = syncSharedSession(contextWithPrompt as Context["messages"], cwd, undefined, modelId);
-			resumeSessionId = sync.sessionId;
-		}
+		// Resuming the existing session id assumed it already held every message
+		// omp has, which is only true when the last turn went through this
+		// provider. After a turn on another provider, or a compaction, the file
+		// is behind and the delegation answered without the recent history it
+		// promises. Run the same sync the provider path runs: it REUSEs when the
+		// file is current and rebuilds when it is not.
+		const contextWithPrompt = [...options.context, { role: "user" as const, content: prompt, timestamp: Date.now() }];
+		const sync = syncSharedSession(contextWithPrompt as Context["messages"], cwd, undefined, modelId);
+		resumeSessionId = sync.sessionId;
+		debug(`askClaude: shared mode, resume=${resumeSessionId?.slice(0, 8) ?? "none"} (context=${options.context.length} msgs)`);
 	}
 
 	// Mode → disallowed tools
@@ -1888,13 +1924,21 @@ async function promptAndWait(
 		wasAborted = true;
 		sdkQuery.interrupt().catch(() => { try { sdkQuery.close(); } catch {} });
 	};
-	if (signal?.aborted) { onAbort(); throw new Error("Aborted"); }
+	// Throwing here used to skip the try/finally below, leaving the query we just
+	// spawned without close(): an already-aborted signal (a cancelled task whose
+	// tool still ran) leaked a Claude Code process.
+	if (signal?.aborted) {
+		onAbort();
+		try { sdkQuery.close(); } catch { /* already gone */ }
+		throw new Error("Aborted");
+	}
 	signal?.addEventListener("abort", onAbort, { once: true });
 
 	let responseText = "";
 	let sdkMessageCount = 0;
 	let textDeltaCount = 0;
 	let resultSubtype: string | undefined;
+	let resultError: string | undefined;
 
 	try {
 		for await (const message of sdkQuery) {
@@ -1942,16 +1986,24 @@ async function promptAndWait(
 					if (!responseText && message.subtype === "success" && message.result) {
 						responseText = message.result;
 					}
+					// A result can carry a failure (usage limit, auth, execution error)
+					// while the loop ends normally. Reporting that as a successful stop
+					// with empty text told the caller the delegation had nothing to say.
+					if (r.is_error === true || (message.subtype !== "success" && !responseText)) {
+						resultError = (Array.isArray(r.errors) && r.errors.length ? r.errors.map(String).join("; ") : r.result)
+							|| `Claude Code result ${message.subtype ?? "unknown"}`;
+					}
 					break;
 				}
 			}
 		}
 
-		const stopReason = wasAborted ? "cancelled" : "stop";
+		const stopReason = wasAborted ? "cancelled" : resultError ? "error" : "stop";
 		debug(`askClaude: done`,
 			`stopReason=${stopReason} resultSubtype=${resultSubtype ?? "none"}`,
 			`sdkMessages=${sdkMessageCount} textDeltas=${textDeltaCount} responseLen=${responseText.length}`,
-			`toolCalls=${toolCalls.size}`);
+			`toolCalls=${toolCalls.size}${resultError ? ` error=${resultError.slice(0, 160)}` : ""}`);
+		if (resultError && !wasAborted) throw new Error(resultError);
 		return { responseText, stopReason };
 	} finally {
 		signal?.removeEventListener("abort", onAbort);
@@ -2121,9 +2173,19 @@ export default function (pi: ExtensionAPI) {
 		// limit). Give up first, so omp still has time for its own methods.
 		const deadlineMs = providerSettings.compactDeadlineMs ?? 25_000;
 		let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+		// Losing the race has to stop the work, not just stop waiting for it: the
+		// summary subprocess would otherwise keep running (and keep spending) for
+		// a result nobody will read.
+		const deadlineAbort = new AbortController();
 		const deadline = new Promise<never>((_, reject) => {
-			deadlineTimer = setTimeout(() => reject(new Error(`takeover exceeded ${deadlineMs}ms; leaving compaction to omp`)), deadlineMs);
+			deadlineTimer = setTimeout(() => {
+				deadlineAbort.abort();
+				reject(new Error(`takeover exceeded ${deadlineMs}ms; leaving compaction to omp`));
+			}, deadlineMs);
 		});
+		const signal = event.signal
+			? (AbortSignal as unknown as { any(list: AbortSignal[]): AbortSignal }).any?.([event.signal, deadlineAbort.signal]) ?? event.signal
+			: deadlineAbort.signal;
 		try {
 			reinjectPriorCompactionFileOps(event.branchEntries, event.preparation);
 			const compaction = await Promise.race([
@@ -2132,7 +2194,7 @@ export default function (pi: ExtensionAPI) {
 					ctx.model,
 					undefined,
 					event.customInstructions,
-					event.signal,
+					signal,
 					{ completeImpl: isolatedCompleteImpl },
 				),
 				deadline,

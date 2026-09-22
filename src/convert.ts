@@ -14,7 +14,16 @@ export const PI_TO_SDK_TOOL_NAME: Record<string, string> = {
 export function sanitizeToolId(id: string, cache: Map<string, string>): string {
 	const existing = cache.get(id);
 	if (existing) return existing;
-	const clean = id.replace(/[^a-zA-Z0-9_-]/g, "_");
+	let clean = id.replace(/[^a-zA-Z0-9_-]/g, "_");
+	// Substitution is lossy: "call.a" and "call/a" both become "call_a", and two
+	// tool_use blocks sharing an id break the pairing with their results. Keep
+	// the collision-free property by suffixing when the name is already taken.
+	if (clean !== id) {
+		const taken = new Set(cache.values());
+		let candidate = clean;
+		for (let n = 2; taken.has(candidate); n++) candidate = `${clean}_${n}`;
+		clean = candidate;
+	}
 	cache.set(id, clean);
 	return clean;
 }

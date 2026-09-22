@@ -65,9 +65,13 @@ export function makePromptStream(): PromptStream {
 			}
 		} finally {
 			// No consumer left to drain the queue, so nothing would ever settle a
-			// later push. Closing here keeps the reject-never-hang contract a
-			// property of this module rather than of every call site.
+			// later push. Closing here, and rejecting whatever is already queued,
+			// keeps the reject-never-hang contract a property of this module
+			// rather than of every call site: a consumer that abandons iteration
+			// used to leave earlier pushes pending until someone called fail().
 			done = true;
+			const abandoned = failure ?? new Error("prompt stream closed");
+			queue.splice(0).forEach((item) => item.reject(abandoned));
 		}
 	}
 

@@ -86,6 +86,37 @@ Findings from an independent review of this release, fixed here:
   this process's environment, debug logs are not redacted, and the scope is personal use with
   your own subscription.
 
+### Review follow-ups, second pass
+
+The remaining findings from the same review:
+
+- **AskClaude answered without the recent history it promises.** In shared mode it resumed the
+  existing session id outright, which is only current when the last turn went through this
+  provider; after a turn on another provider, or a compaction, the session file was behind. It now
+  runs the same sync the provider path runs, which reuses a current file and rebuilds a stale one.
+- **AskClaude reported failures as empty successes.** A result carrying `is_error` (usage limit,
+  auth, execution error) ended the loop normally and returned `{ responseText: "", stopReason:
+  "stop" }`. The failure is now propagated.
+- **AskClaude leaked a process when its signal arrived already aborted**: the throw happened
+  before the `try`/`finally` that closes the query.
+- **The pre-warm key could accept a differently-configured process.** It identified the system
+  prompt by length plus its first 80 characters — shorter than the host-prompt header alone — and
+  tools by name only, so an edited prompt or a changed tool schema still matched. It now digests
+  the whole prompt, the tool definitions, the environment and the effective options.
+- **A discarded pre-warm could come back.** A `startup()` still in flight when the process was
+  discarded (shutdown, rebuild, replacement) published its handle on arrival. Each discard now
+  bumps a generation, and a handle from a superseded one is closed instead of published.
+- **The compaction takeover's deadline abandoned its work without stopping it.** `Promise.race`
+  returned control to the host while the summary subprocess kept running, and spending, for a
+  result nobody would read. The deadline now aborts it. (Only reachable with
+  `provider.compactTakeover: true`.)
+- **Sanitizing tool ids could merge two of them.** `call.a` and `call/a` both became `call_a`, so
+  a rebuilt history could carry two `tool_use` blocks sharing an id. Substitution now keeps ids
+  distinct.
+- **Abandoning the prompt stream left queued pushes pending.** A consumer that stopped iterating
+  settled only the in-flight message; the rest waited for an external `fail()`. The generator now
+  rejects the whole queue itself, which is what the module's contract already claimed.
+
 ### Notes
 - Compaction with omp's `snapcompact` method injects an archive whose preamble describes
   reconstructing a verbatim transcript including the assistant's reasoning. Opus 5 refuses the
