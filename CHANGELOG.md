@@ -4,9 +4,24 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.9.1] - 2026-09-23
+
+Verified against omp 18.2.9 and Claude Code 2.1.278 on Windows.
 
 ### Fixed
+- **Harness messages reached Claude as "[continue]".** omp sends todo reminders, TTSR
+  rules and unexpected-stop nudges with role `developer`; the bridge only took a trailing
+  `user` message as the prompt, so a reminder became the literal "[continue]" (Opus 5.5
+  often answered with an empty stop), a reminder next to a tool result was never steered
+  into the live query, and history rebuilds dropped developer messages. They now travel
+  as user content wrapped in a `<system-reminder>` that marks them as harness input, on
+  the fresh-query, steer and rebuild paths. The prompt is every user/developer message
+  after the last assistant turn, not only the last one.
+- **Lossy session rebuilds.** cc-session-io's `importMessages` kept only the
+  `tool_result` blocks of a user message (dropping text and images next to them) and
+  flattened the rest to text; rebuilds now write full content blocks. Consecutive user
+  messages are merged, tool results first, before `repairToolPairing`, which otherwise
+  replaced a real parallel result with a synthetic "[no tool result recorded]".
 - Orphaned tool results now end quietly after abort, including when a developer reminder
   follows the result, without resetting an unrelated active query.
 - Repeated tool-result callbacks cannot release MCP handlers before a pending developer
