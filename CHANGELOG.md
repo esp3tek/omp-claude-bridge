@@ -4,6 +4,22 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- Orphaned tool results now end quietly after abort, including when a developer reminder
+  follows the result, without resetting an unrelated active query.
+- Repeated tool-result callbacks cannot release MCP handlers before a pending developer
+  write is acknowledged. Finalizing an earlier query no longer unregisters the next query.
+- Subagents and zero-history side requests leave the main session's cursor, rebuild flags
+  and prewarmed process untouched, including after aborts and failed side requests.
+- Rebuilt tool results retain image blocks, and sanitized tool IDs remain unique even
+  when an already-valid ID collides with an earlier sanitized ID.
+
+### Changed
+- Session synchronization takes explicit prior history. AskClaude passes its entire
+  history separately from the delegation prompt, without appending a synthetic message.
+
 ## [0.9.0] - 2026-09-22
 
 First release of the `esp3tek` fork, on top of `DevVig/omp-claude-bridge` 0.8.1.

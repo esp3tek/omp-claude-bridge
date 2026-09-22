@@ -12,7 +12,7 @@ import { createSession, deleteSession, repairToolPairing } from "cc-session-io";
 import { appendFileSync, mkdirSync, readdirSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from "fs";
 import { homedir } from "os";
 import { dirname, join } from "path";
-import { PROVIDER_ID, messageContentToText, convertPiMessages, importMessagesLossless, splitPendingInput, type PendingInput } from "./convert.js";
+import { PROVIDER_ID, messageContentToText, convertPiMessages, importMessagesLossless, splitPendingInput } from "./convert.js";
 import { buildVariantModels, buildModels, STATIC_FALLBACK_IDS, claudeCodeModelId, type ContextWindowMode, type LongContextSettings, resolveModel as _resolveModel } from "./models.js";
 import { MCP_SERVER_NAME, MCP_TOOL_PREFIX, extractSkillsBlock } from "./skills.js";
 import { verifyWrittenSession as _verifyWrittenSession } from "./session-verify.js";
@@ -30,7 +30,7 @@ import { fetchClaudeCodeModels, toProviderModels } from "./claude-models.js";
 
 // Compat (#2): use factory if available (pi-ai ≥0.66), else fall back to constructor (gsd-pi etc.)
 const _piAi = piAi as any;
-const newAssistantMessageEventStream: () => AssistantMessageEventStream =
+let newAssistantMessageEventStream: () => AssistantMessageEventStream =
 	typeof _piAi.createAssistantMessageEventStream === "function"
 		? _piAi.createAssistantMessageEventStream
 		: () => new _piAi.AssistantMessageEventStream();
@@ -272,7 +272,7 @@ function convertAndImportMessages(
 		debug(`convertAndImportMessages: sanitized ${sanitizedIds.size} tool IDs:`,
 			[...sanitizedIds.entries()].map(([orig, clean]) => orig === clean ? orig : `${orig}→${clean}`).join(", "));
 	}
-	// Pre-repair for debug logging; importMessages also repairs internally (idempotent).
+	// Repair once before the lossless importer writes the full content blocks.
 	const repaired = repairToolPairing(anthropicMessages);
 	if (repaired.length !== anthropicMessages.length) {
 		debug(`convertAndImportMessages: repairToolPairing ${anthropicMessages.length} → ${repaired.length} msgs`);
@@ -532,7 +532,7 @@ interface SyncResult {
 }
 
 /**
- * Ensure the shared session has all messages up to (but not including) the last user message.
+ * Ensure the shared session holds the explicit history, excluding input sent separately.
  * Returns session ID to resume from, or null if no resume needed.
  */
 // Read the session file we just wrote and sanity-check it. Warns instead of
@@ -608,20 +608,15 @@ function debugSessionPaths(label: string, cwd: string, jsonlPath: string): void 
 // Log strings still say "Case 1/2/3/4" so existing diagnostics (int-cache.sh,
 // int-session-resume.mjs) keep grepping the same anchors.
 function syncSharedSession(
-	messages: Context["messages"],
+	priorMessages: Context["messages"],
 	cwd: string,
 	customToolNameToSdk?: Map<string, string>,
 	modelId?: string,
 	isReentrant = false,
-	pending?: PendingInput,
+	forceRebuild = false,
 ): SyncResult {
-	// Everything before the new input. With `pending` (provider path) that is all
-	// the user/developer messages after the last assistant turn; without it
-	// (askClaude, tests) the single trailing message.
-	const priorMessages = pending ? pending.history : messages.slice(0, -1);
 	// Input interleaved with tool results: the results go into history and the
 	// input after them, which a count-based resume cannot express.
-	const forceRebuild = pending?.interleaved === true;
 	if (forceRebuild) debug(`syncSharedSession: pending input interleaved with tool results, rebuilding`);
 
 	// A reentrant call (subagent, side query) is decided first, before REUSE can
@@ -634,6 +629,15 @@ function syncSharedSession(
 	if (isReentrant) {
 		debug(`Case 1 synthetic: reentrant context, clean start${sharedSession ? `, preserving shared session ${sharedSession.sessionId.slice(0, 8)} (cursor=${sharedSession.cursor})` : ", no shared session yet"}`);
 		debug(`syncResult: path=clean-start preserve-shared reentrant priors=${priorMessages.length}`);
+		return { sessionId: null, preserveSharedSession: true };
+	}
+
+	// Zero priors is a one-shot side request once the main session has history
+	// (/new clears it via session_start). Decide ownership before rebuild flags:
+	// a side request after an abort must not replace the parent's pending session.
+	if (sharedSession && sharedSession.cursor > 0 && priorMessages.length === 0) {
+		debug(`Case 1 synthetic: clean start for zero-prior side request, preserving shared session ${sharedSession.sessionId.slice(0, 8)}, cursor=${sharedSession.cursor}`);
+		debug(`syncResult: path=clean-start preserve-shared sessionId=${sharedSession.sessionId} cursor=${sharedSession.cursor}`);
 		return { sessionId: null, preserveSharedSession: true };
 	}
 
@@ -657,31 +661,16 @@ function syncSharedSession(
 			return { sessionId: sharedSession.sessionId };
 		}
 	}
-	// A shorter context than the cursor. Two very different situations:
-	//   - A reentrant call (subagent / side query) carrying its own short
-	//     history: give it a throwaway clean start and leave the shared
-	//     session untouched.
-	//   - The MAIN conversation: pi rewrote its history without an event we
-	//     handle (context pruning, cursor drift after a deferred steer replay,
-	//     a compaction whose needsRebuild flag got lost). A clean start here
-	//     would run Claude Code without --resume, i.e. with NO history at all
-	//     (upstream pi-claude-bridge issues #55 and #62). Fall through to
-	//     REBUILD instead: costs a cache rewrite, never loses the conversation.
+	// A shorter MAIN context means omp rewrote its history without an event we
+	// handle (pruning, cursor drift, compaction). Rebuild instead of starting
+	// without history. Reentrant and zero-prior side requests returned above.
 	if (sharedSession && !sharedSession.needsRebuild && !forceRebuild && priorMessages.length < sharedSession.cursor) {
-		// Zero priors is never the main conversation once cursor >= 1 (/new
-		// clears the session via session_start): it is a one-shot side request
-		// (memories, commit message, judgment...) routed to this provider.
-		if (priorMessages.length === 0) {
-			debug(`Case 1 synthetic: clean start for zero-prior side request, preserving shared session ${sharedSession.sessionId.slice(0, 8)}, cursor=${sharedSession.cursor}`);
-			debug(`syncResult: path=clean-start preserve-shared sessionId=${sharedSession.sessionId} cursor=${sharedSession.cursor}`);
-			return { sessionId: null, preserveSharedSession: true };
-		}
 		debug(`Case 4 drift: main context shorter than cursor (${priorMessages.length} < ${sharedSession.cursor}), rebuilding instead of clean start`);
 	}
 
 	// REBUILD path
 	if (priorMessages.length === 0) {
-		debug(`Case 1: clean start, ${messages.length} total messages`);
+		debug(`Case 1: clean start, no prior messages`);
 		debug(`syncResult: path=clean-start`);
 		return { sessionId: null };
 	}
@@ -733,6 +722,15 @@ export const __test = {
 		return sharedSession;
 	},
 	syncSharedSession,
+	streamClaudeAgentSdk,
+	getMainQueryContext: ctx,
+	clearSession,
+	promptAndWait,
+	setStreamFactory(factory: () => AssistantMessageEventStream) {
+		const previous = newAssistantMessageEventStream;
+		newAssistantMessageEventStream = factory;
+		return previous;
+	},
 };
 
 // --- Provider helpers: tool name mapping ---
@@ -805,6 +803,7 @@ function contextForToolResults(results: McpResult[]): QueryContext | undefined {
 		const id = result.toolCallId;
 		if (!id) continue;
 		for (const queryCtx of activeQueryContexts) {
+			if (!queryCtx.activeQuery) continue;
 			if (queryCtx.pendingToolCalls.has(id) || queryCtx.pendingResults.has(id) || queryCtx.turnToolCallIds.includes(id)) {
 				return queryCtx;
 			}
@@ -1402,8 +1401,8 @@ function steerBlocks(messages: Context["messages"], c: QueryContext): ContentBlo
  *  session is marked: a subagent's lost steer is not the parent's. The query
  *  context keeps the flag too, for a first query that has no session yet. */
 function steerMissedSession(c: QueryContext, text: string): void {
-	if (c !== ctx()) {
-		debug(`provider: steer never reached a reentrant query, not marking the shared session: ${text.slice(0, 60)}`);
+	if (!c.ownsSharedSession) {
+		debug(`provider: steer never reached an isolated query, not marking the shared session: ${text.slice(0, 60)}`);
 		return;
 	}
 	c.inputMissed = true;
@@ -1488,7 +1487,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	debug(`provider: streamClaudeAgentSdk called, activeQuery=${!!ctx().activeQuery}, lastMsgRole=${lastMsgRole}, isReentrant=${ctx().activeQuery !== null}`);
 
 	const activeQuery = ctx().activeQuery !== null;
-	const allResults = activeQueryContexts.size > 0 ? extractAllToolResults(context) : [];
+	const allResults = extractAllToolResults(context);
 	const resultCtx = allResults.length > 0 ? contextForToolResults(allResults) : undefined;
 	const isReentrantUserQuery = activeQuery && lastMsgRole === "user" && allResults.length === 0;
 	if (isReentrantUserQuery) {
@@ -1500,6 +1499,16 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// (everything after the last assistant message) and match against waiting MCP
 	// handlers. Results that arrive before their handler get queued in pendingResults.
 	if (resultCtx) {
+		if (context.messages.length <= resultCtx.latestCursor) {
+			// A duplicate callback must not replace the waiting output stream or
+			// release handlers while the original steer push still awaits its ack.
+			queueMicrotask(() => {
+				stream.push({ type: "done", reason: "stop", message: newAssistantOutput(model, "", "stop") });
+				markStreamComplete(stream);
+				stream.end();
+			});
+			return stream;
+		}
 		claimCurrentPiStream(stream, "tool-result", resultCtx);
 		resultCtx.resetTurnState(model);
 		// User messages (steer / followUp) omp injected into context during the
@@ -1514,7 +1523,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		// subagent's context is shorter, and letting it write here dragged the
 		// cursor backwards (40 -> 3 in a reproduction), so the parent's next turn
 		// resumed a session that no longer matched its history.
-		if (sharedSession && resultCtx === ctx()) sharedSession.cursor = context.messages.length;
+		if (sharedSession && resultCtx.ownsSharedSession) sharedSession.cursor = Math.max(sharedSession.cursor, context.messages.length);
 		resultCtx.latestCursor = Math.max(resultCtx.latestCursor, context.messages.length);
 		return stream;
 	}
@@ -1529,13 +1538,14 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// waiting next to the result (a reminder omp added before it): that goes to
 	// a fresh query, with the result rebuilt into history, instead of vanishing.
 	const lastMsg = context.messages[context.messages.length - 1];
-	if (lastMsg?.role === "toolResult" && (pendingInput.blocks.length === 0 || options?.signal?.aborted)) {
+	if (allResults.length > 0 && (pendingInput.blocks.length === 0 || options?.signal?.aborted)) {
 		debug(`provider: orphaned tool result after abort, emitting end_turn`);
-		if (sharedSession) sharedSession.cursor = Math.max(sharedSession.cursor, context.messages.length);
-		const c = ctx();  // capture current context for the microtask
+		if (sharedSession && !activeQuery) {
+			if (pendingInput.blocks.length > 0) sharedSession = { ...sharedSession, needsRebuild: true };
+			else sharedSession.cursor = Math.max(sharedSession.cursor, context.messages.length);
+		}
 		queueMicrotask(() => {
-			c.resetTurnState(model);
-			stream.push({ type: "done", reason: "stop", message: c.turnOutput });
+			stream.push({ type: "done", reason: "stop", message: newAssistantOutput(model, "", "stop") });
 			markStreamComplete(stream);
 			stream.end();
 		});
@@ -1561,8 +1571,10 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 
 	const { mcpTools, customToolNameToSdk, customToolNameToPi } = resolveMcpTools(context, askClaudeToolName);
 	const cwd = (options as { cwd?: string } | undefined)?.cwd ?? process.cwd();
-	const syncResult = syncSharedSession(context.messages, cwd, customToolNameToSdk, model.id, isReentrant, pendingInput);
+	const syncResult = syncSharedSession(pendingInput.history as Context["messages"], cwd, customToolNameToSdk, model.id, isReentrant, pendingInput.interleaved);
 	const { sessionId: resumeSessionId } = syncResult;
+	const ownsSharedSession = !isReentrant && !syncResult.preserveSharedSession;
+	queryCtx.ownsSharedSession = ownsSharedSession;
 	const promptBlocks = pendingInput.blocks.length ? (pendingInput.blocks as ContentBlockParam[]) : null;
 	let promptText = "";
 	if (pendingInput.pendingIndices.length > 1 || context.messages[pendingInput.pendingIndices[0]]?.role === "developer") {
@@ -1692,7 +1704,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 
 	// 3. Start SDK query and claim it for this context
 	let wasAborted = false;
-	const warm = isReentrant ? null : takeWarm(warmKey(queryOptions as Record<string, unknown>, mcpTools));
+	const warm = ownsSharedSession ? takeWarm(warmKey(queryOptions as Record<string, unknown>, mcpTools)) : null;
 	const sdkQuery = warm ? warm.query(prompt) : query({ prompt, options: queryOptions });
 	queryCtx.activeQuery = sdkQuery;
 	activeQueryContexts.add(queryCtx);
@@ -1708,7 +1720,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	};
 	const onAbort = () => {
 		wasAborted = true;
-		discardWarm("abort");
+		if (ownsSharedSession) discardWarm("abort");
 		drainForAbort(abortCtx, promptStream);
 		abortCtx.pendingToolCalls.clear();
 		abortCtx.pendingResults.clear();
@@ -1726,8 +1738,8 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 
 			// --- Abort detection in normal completion path ---
 			if (wasAborted || options?.signal?.aborted) {
-				if (sharedSession) sharedSession = { ...sharedSession, needsRebuild: true, forceRotate: true };
-				debug(`provider: abort detected, marked sharedSession needsRebuild + forceRotate`);
+				if (ownsSharedSession && sharedSession) sharedSession = { ...sharedSession, needsRebuild: true, forceRotate: true };
+				debug(`provider: abort detected${ownsSharedSession ? ", marked sharedSession needsRebuild + forceRotate" : ", preserving sharedSession"}`);
 				if (queryCtx.turnOutput) {
 					queryCtx.turnOutput.stopReason = "aborted";
 					queryCtx.turnOutput.errorMessage = "Operation aborted";
@@ -1745,7 +1757,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			// A reentrant (subagent) query never becomes the shared session either:
 			// a child that finishes after its parent would otherwise hand the next
 			// main turn a --resume onto the child's own history.
-			if (syncResult.preserveSharedSession || isReentrant) {
+			if (!ownsSharedSession) {
 				if (capturedSessionId && capturedSessionId !== sharedSession?.sessionId) {
 					deleteSession(capturedSessionId, cwd, process.env.CLAUDE_CONFIG_DIR);
 					debug(`provider: query done, deleted ephemeral session ${capturedSessionId.slice(0, 8)} to preserve shared session`);
@@ -1775,7 +1787,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			// turn just extended. Only for a clean main-thread stop with a session
 			// to resume and no pending rebuild (a rebuild rewrites the JSONL the
 			// warm process would be reading).
-			if (!isReentrant && sharedSession && !sharedSession.needsRebuild && queryCtx.turnOutput?.stopReason === "stop") {
+			if (ownsSharedSession && sharedSession && !sharedSession.needsRebuild && queryCtx.turnOutput?.stopReason === "stop") {
 				const nextOptions = {
 					...queryOptions,
 					resume: sharedSession.sessionId,
@@ -1786,11 +1798,13 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		})
 		.catch((error) => {
 			debug(`provider: query error, model=${cliModel}, aborted=${Boolean(options?.signal?.aborted)}, error=`, error);
-			if (!isReentrant) discardWarm("query error");
-			if ((wasAborted || options?.signal?.aborted) && sharedSession) {
-				sharedSession = { ...sharedSession, needsRebuild: true, forceRotate: true };
-			} else if (!isReentrant) {
-				sharedSession = null;
+			if (ownsSharedSession) {
+				discardWarm("query error");
+				if ((wasAborted || options?.signal?.aborted) && sharedSession) {
+					sharedSession = { ...sharedSession, needsRebuild: true, forceRotate: true };
+				} else {
+					sharedSession = null;
+				}
 			}
 			if (queryCtx.turnOutput) {
 				queryCtx.turnOutput.stopReason = options?.signal?.aborted ? "aborted" : "error";
@@ -1819,7 +1833,8 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 				queryCtx.pendingResults.clear();
 				queryCtx.activeQuery = null;
 			}
-			activeQueryContexts.delete(queryCtx);
+			// Ending the stream can start the next query before this finally runs.
+			if (!queryCtx.activeQuery) activeQueryContexts.delete(queryCtx);
 			sdkQuery.close();
 		});
 
@@ -1840,7 +1855,7 @@ async function promptAndWait(
 		model?: string;
 		thinking?: string;
 		isolated?: boolean;
-		context?: Context["messages"];
+		history?: Context["messages"];
 	},
 ): Promise<{ responseText: string; stopReason: string }> {
 	const cwd = process.cwd();
@@ -1854,17 +1869,16 @@ async function promptAndWait(
 	// Note: doesn't update sharedSession.cursor after completion, so the next
 	// provider call will see missed messages and trigger a Case 4 rebuild.
 	let resumeSessionId: string | null = null;
-	if (!options?.isolated && options?.context?.length) {
+	if (!options?.isolated && options?.history?.length) {
 		// Resuming the existing session id assumed it already held every message
 		// omp has, which is only true when the last turn went through this
 		// provider. After a turn on another provider, or a compaction, the file
 		// is behind and the delegation answered without the recent history it
 		// promises. Run the same sync the provider path runs: it REUSEs when the
 		// file is current and rebuilds when it is not.
-		const contextWithPrompt = [...options.context, { role: "user" as const, content: prompt, timestamp: Date.now() }];
-		const sync = syncSharedSession(contextWithPrompt as Context["messages"], cwd, undefined, modelId);
+		const sync = syncSharedSession(options.history, cwd, undefined, modelId);
 		resumeSessionId = sync.sessionId;
-		debug(`askClaude: shared mode, resume=${resumeSessionId?.slice(0, 8) ?? "none"} (context=${options.context.length} msgs)`);
+		debug(`askClaude: shared mode, resume=${resumeSessionId?.slice(0, 8) ?? "none"} (history=${options.history.length} msgs)`);
 	}
 
 	// Mode → disallowed tools
@@ -2004,6 +2018,21 @@ async function promptAndWait(
 	}
 }
 
+// Reset shared session on pi session lifecycle events.
+function clearSession(event = "test reset"): void {
+	debug(`${event}: clearing session ${sharedSession?.sessionId?.slice(0, 8) ?? "none"}`);
+	sharedSession = null;
+	discardWarm(event);
+
+	// Clear the global streamSimple if this instance registered it.
+	// This allows /reload to register fresh without wrapping stale state.
+	const g = globalThis as Record<symbol, any>;
+	if (g[ACTIVE_STREAM_SIMPLE_KEY] === streamClaudeAgentSdk) {
+		debug(`${event}: clearing ACTIVE_STREAM_SIMPLE_KEY`);
+		g[ACTIVE_STREAM_SIMPLE_KEY] = undefined;
+	}
+}
+
 // --- Extension registration ---
 
 const DEFAULT_TOOL_DESCRIPTION_FULL = "Delegate to Claude Code for a second opinion or analysis (code review, architecture questions, debugging theories), or to autonomously handle a task. Defaults to read-only mode — use full mode when the user wants to delegate a task that requires changes. Prefer to handle straightforward tasks yourself.";
@@ -2113,21 +2142,6 @@ export default function (pi: ExtensionAPI) {
 	};
 	registerBridgeProvider("activate");
 
-	// Reset shared session on pi session lifecycle events
-	const clearSession = (event: string) => {
-		debug(`${event}: clearing session ${sharedSession?.sessionId?.slice(0, 8) ?? "none"}`);
-		sharedSession = null;
-		discardWarm(event);
-
-		// Clear the global streamSimple if this instance registered it.
-		// This allows /reload to work — the old instance clears the flag so
-		// the new instance can register fresh without wrapping stale state.
-		const g = globalThis as Record<symbol, any>;
-		if (g[ACTIVE_STREAM_SIMPLE_KEY] === streamClaudeAgentSdk) {
-			debug(`${event}: clearing ACTIVE_STREAM_SIMPLE_KEY`);
-			g[ACTIVE_STREAM_SIMPLE_KEY] = undefined;
-		}
-	};
 	pi.on("session_start", (_event, ctx) => {
 		piUI = ctx.ui;
 		clearSession("session_start");
@@ -2353,7 +2367,7 @@ export default function (pi: ExtensionAPI) {
 						model: askParams.model,
 						thinking: askParams.thinking,
 						isolated,
-						context: isolated ? undefined : buildSessionContext(ctx.sessionManager.getBranch()).messages as Context["messages"],
+						history: isolated ? undefined : buildSessionContext(ctx.sessionManager.getBranch()).messages as Context["messages"],
 					});
 					clearInterval(progressInterval);
 					onUpdate?.({ content: [{ type: "text", text: "" }], details: {} });

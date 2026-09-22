@@ -1,5 +1,5 @@
 import { test, expect } from "bun:test";
-import { convertPiMessages } from "../src/convert.ts";
+import { convertPiMessages, sanitizeToolId } from "../src/convert.ts";
 const think = (t: string) => ({ type: "thinking", thinking: t, thinkingSignature: "sig-" + t });
 const asst = (t: string, extra: any[] = []) => ({ role: "assistant", provider: "claude-bridge", content: [think(t), { type: "text", text: "answer " + t }, ...extra], timestamp: 1 });
 const user = (t: string) => ({ role: "user", content: t, timestamp: 1 });
@@ -28,17 +28,32 @@ test("dropping thinking never empties an assistant message", () => {
   for (const m of r.anthropicMessages) if (m.role === "assistant") expect((m.content as any[]).length).toBeGreaterThan(0);
 });
 
-import { sanitizeToolId } from "../src/convert.ts";
-
-test("sanitizing tool ids never maps two different ids onto one", () => {
+test("sanitizing tool ids gives lossy collisions unique, stable valid mappings", () => {
   const cache = new Map<string, string>();
-  expect(sanitizeToolId("call.a", cache)).toBe("call_a");
-  expect(sanitizeToolId("call/a", cache)).toBe("call_a_2");
-  expect(sanitizeToolId("call.a", cache)).toBe("call_a"); // stable per id
-  expect(new Set(cache.values()).size).toBe(cache.size);
+  const usedIds = new Set<string>();
+  const first = sanitizeToolId("call.a", cache, usedIds);
+  const second = sanitizeToolId("call/a", cache, usedIds);
+
+  expect(first).not.toBe(second);
+  expect(sanitizeToolId("call.a", cache, usedIds)).toBe(first);
+  expect([first, second].every((id) => /^[a-zA-Z0-9_-]+$/.test(id))).toBe(true);
 });
 
-test("an id that needs no substitution is passed through", () => {
+test("sanitizing an available valid id preserves it", () => {
   const cache = new Map<string, string>();
-  expect(sanitizeToolId("toolu_01ABC-def", cache)).toBe("toolu_01ABC-def");
+  const usedIds = new Set<string>();
+
+  expect(sanitizeToolId("toolu_01ABC-def", cache, usedIds)).toBe("toolu_01ABC-def");
 });
+
+test("sanitizing a valid id after its lossy equivalent keeps result pairing stable", () => {
+  const cache = new Map<string, string>();
+  const usedIds = new Set<string>();
+  const lossyId = sanitizeToolId("call.a", cache, usedIds);
+  const validId = sanitizeToolId("call_a", cache, usedIds);
+
+  expect(validId).not.toBe(lossyId);
+  expect(sanitizeToolId("call_a", cache, usedIds)).toBe(validId);
+  expect(/^[a-zA-Z0-9_-]+$/.test(validId)).toBe(true);
+});
+

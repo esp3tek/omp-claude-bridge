@@ -11,21 +11,18 @@ export const PI_TO_SDK_TOOL_NAME: Record<string, string> = {
 	read: "Read", write: "Write", edit: "Edit", bash: "Bash",
 };
 
-export function sanitizeToolId(id: string, cache: Map<string, string>): string {
+export function sanitizeToolId(id: string, cache: Map<string, string>, usedIds: Set<string>): string {
 	const existing = cache.get(id);
-	if (existing) return existing;
-	let clean = id.replace(/[^a-zA-Z0-9_-]/g, "_");
+	if (existing !== undefined) return existing;
+	const clean = id.replace(/[^a-zA-Z0-9_-]/g, "_");
 	// Substitution is lossy: "call.a" and "call/a" both become "call_a", and two
-	// tool_use blocks sharing an id break the pairing with their results. Keep
-	// the collision-free property by suffixing when the name is already taken.
-	if (clean !== id) {
-		const taken = new Set(cache.values());
-		let candidate = clean;
-		for (let n = 2; taken.has(candidate); n++) candidate = `${clean}_${n}`;
-		clean = candidate;
-	}
-	cache.set(id, clean);
-	return clean;
+	// tool_use blocks sharing an id break the pairing with their results. A valid
+	// id can collide with a previously sanitized id too, so always suffix taken IDs.
+	let candidate = clean;
+	for (let n = 2; usedIds.has(candidate); n++) candidate = `${clean}_${n}`;
+	cache.set(id, candidate);
+	usedIds.add(candidate);
+	return candidate;
 }
 
 export function mapPiToolNameToSdk(name: string, customToolNameToSdk?: Map<string, string>): string {
@@ -143,7 +140,8 @@ export function convertPiMessages(
 	thinkingReplay: ThinkingReplay = "last",
 ): { anthropicMessages: SessionMessage[]; sanitizedIds: Map<string, string>; droppedThinking: number } {
 	const anthropicMessages = [];
-	const sanitizedIds = new Map();
+	const sanitizedIds = new Map<string, string>();
+	const usedSanitizedIds = new Set<string>();
 	let droppedThinking = 0;
 	// Only the turn being continued needs its thinking blocks; the API accepts
 	// earlier assistant turns without them.
@@ -177,16 +175,18 @@ export function convertPiMessages(
 					}
 				} else if (block.type === "toolCall") {
 					const toolName = mapPiToolNameToSdk(block.name, customToolNameToSdk);
-					blocks.push({ type: "tool_use", id: sanitizeToolId(block.id, sanitizedIds), name: toolName, input: block.arguments ?? {} });
+					blocks.push({ type: "tool_use", id: sanitizeToolId(block.id, sanitizedIds, usedSanitizedIds), name: toolName, input: block.arguments ?? {} });
 				}
 			}
 			if (!blocks.length) blocks.push({ type: "text", text: "[incompatible content omitted]" });
 			anthropicMessages.push({ role: "assistant", content: blocks });
 		} else if (msg.role === "toolResult") {
-			const text = typeof msg.content === "string" ? msg.content : messageContentToText(msg.content);
+			const blocks = typeof msg.content === "string" ? [] : promptMessageBlocks({ role: "user", content: msg.content });
+			// Keep the old empty-string shape when there is nothing to carry.
+			const content = typeof msg.content === "string" ? msg.content : blocks.length ? blocks : "";
 			anthropicMessages.push({
 				role: "user",
-				content: [{ type: "tool_result", tool_use_id: sanitizeToolId(msg.toolCallId, sanitizedIds), content: text || "", is_error: msg.isError }],
+				content: [{ type: "tool_result", tool_use_id: sanitizeToolId(msg.toolCallId, sanitizedIds, usedSanitizedIds), content, is_error: msg.isError }],
 			});
 		}
 	}

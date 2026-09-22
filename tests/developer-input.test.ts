@@ -2,20 +2,30 @@
 // Code as user content, marked as harness input, on every path: fresh query,
 // session rebuild and resume. Before the fix a trailing developer message became
 // the literal prompt "[continue]" and history rebuilds dropped it.
-import { test, expect } from "bun:test";
-import { mkdtempSync, readFileSync } from "fs";
-import { tmpdir } from "os";
+import { afterAll, afterEach, beforeEach, expect, test } from "bun:test";
+import { mkdtempSync, readFileSync, rmSync } from "fs";
 import { join } from "path";
 import { createSession, repairToolPairing } from "cc-session-io";
 import {
 	DEVELOPER_OPEN, DEVELOPER_CLOSE, convertPiMessages, groupUserRuns, importMessagesLossless,
 	promptMessageBlocks, splitPendingInput,
 } from "../src/convert.ts";
+import type { Message as PiMessage } from "@oh-my-pi/pi-coding-agent/extensibility/legacy-pi-ai-shim";
 
-process.env.CLAUDE_CONFIG_DIR ??= mkdtempSync(join(tmpdir(), "cc-"));
+const cwd = mkdtempSync(join(import.meta.dir, ".tmp-cc-"));
+let priorClaudeConfigDir: string | undefined;
+beforeEach(() => {
+	priorClaudeConfigDir = process.env.CLAUDE_CONFIG_DIR;
+	process.env.CLAUDE_CONFIG_DIR = cwd;
+});
 const mod = await import("../src/index.ts");
 const T = (mod as any).__test;
-const cwd = process.env.CLAUDE_CONFIG_DIR!;
+afterEach(() => {
+	if (priorClaudeConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+	else process.env.CLAUDE_CONFIG_DIR = priorClaudeConfigDir;
+	T.resetSharedSession();
+});
+afterAll(() => rmSync(cwd, { recursive: true, force: true }));
 
 const u = (t: string) => ({ role: "user", content: t, timestamp: 1 });
 const dev = (t: string) => ({ role: "developer", content: [{ type: "text", text: t }], timestamp: 1 });
@@ -97,6 +107,45 @@ test("rebuild keeps images and text next to tool results (cc-session-io importMe
 	expect(blocks.map((b) => b.type)).toEqual(["tool_result", "text", "image", "text"]);
 });
 
+test("rebuild preserves images inside tool results", () => {
+	// Test fixtures omit Pi's irrelevant provider metadata.
+	const msgs = [
+		u("a"),
+		call("t1"),
+		{ role: "toolResult", toolCallId: "t1", content: [{ type: "text", text: "R1" }, IMG], isError: false, timestamp: 1 },
+		a("ok"),
+	] as unknown as PiMessage[];
+	const repaired = repairToolPairing(convertPiMessages(msgs, undefined).anthropicMessages);
+	const session = createSession({ projectPath: cwd, claudeDir: cwd });
+	importMessagesLossless(session, repaired);
+	session.save();
+	const jsonl = readFileSync(session.jsonlPath, "utf8");
+	const records = jsonl.trim().split("\n").map((line) => JSON.parse(line));
+	const result = records.flatMap((record) => record.message?.content ?? [])
+		.find((block) => block.type === "tool_result");
+	expect(result.content).toEqual([
+		{ type: "text", text: "R1" },
+		{ type: "image", source: { type: "base64", media_type: IMG.mimeType, data: IMG.data } },
+	]);
+});
+
+test("conversion keeps tool IDs unique when a sanitized ID precedes a valid ID", () => {
+	// Test fixtures omit Pi's irrelevant provider metadata.
+	const messages = [u("a"), call("call.a", "call_a"), res("call.a", "first"), res("call_a", "second")] as unknown as PiMessage[];
+	const repaired = repairToolPairing(convertPiMessages(messages).anthropicMessages);
+	const blocks = repaired.flatMap((message) => Array.isArray(message.content) ? message.content : []);
+	const toolUses = blocks.filter((block) => block.type === "tool_use");
+	const toolResults = blocks.filter((block) => block.type === "tool_result");
+	expect(new Set(toolUses.map((block) => block.id)).size).toBe(2);
+	expect(toolUses.map((call) => ({
+		path: call.input.path,
+		content: toolResults.find((result) => result.tool_use_id === call.id)?.content,
+	}))).toEqual([
+		{ path: "call.a", content: [{ type: "text", text: "first" }] },
+		{ path: "call_a", content: [{ type: "text", text: "second" }] },
+	]);
+});
+
 test("groupUserRuns merges consecutive user turns and leaves single ones alone", () => {
 	const out = groupUserRuns([
 		{ role: "user", content: "x" },
@@ -113,7 +162,8 @@ test("sync: trailing reminder after a delivered tool result resumes the session"
 	T.resetSharedSession();
 	T.setSharedSession({ sessionId: "44444444-4444-4444-8444-444444444444", cursor: 3, cwd });
 	const msgs: any[] = [u("a"), call("t1"), res("t1", "R1"), dev(REMINDER)];
-	const r = T.syncSharedSession(msgs, cwd, undefined, "claude-sonnet-5", false, splitPendingInput(msgs));
+	const pending = splitPendingInput(msgs);
+	const r = T.syncSharedSession(pending.history, cwd, undefined, "claude-sonnet-5", false, pending.interleaved);
 	expect(r.sessionId).toBe("44444444-4444-4444-8444-444444444444");
 	expect(T.getSharedSession().cursor).toBe(3);
 });
@@ -122,7 +172,8 @@ test("sync: user prompt plus reminder after the final answer resumes (no rebuild
 	T.resetSharedSession();
 	T.setSharedSession({ sessionId: "55555555-5555-4555-8555-555555555555", cursor: 1, cwd });
 	const msgs: any[] = [u("a"), a("b"), u("c"), dev("d")];
-	const r = T.syncSharedSession(msgs, cwd, undefined, "claude-sonnet-5", false, splitPendingInput(msgs));
+	const pending = splitPendingInput(msgs);
+	const r = T.syncSharedSession(pending.history, cwd, undefined, "claude-sonnet-5", false, pending.interleaved);
 	expect(r.sessionId).toBe("55555555-5555-4555-8555-555555555555");
 	expect(T.getSharedSession().cursor).toBe(2);
 });
@@ -131,7 +182,8 @@ test("sync: interleaved input forces a rebuild that carries the tool results", (
 	T.resetSharedSession();
 	T.setSharedSession({ sessionId: "66666666-6666-4666-8666-666666666666", cursor: 5, cwd });
 	const msgs: any[] = [u("a"), call("t1", "t2"), res("t1", "R1"), dev("r"), res("t2", "R2")];
-	const r = T.syncSharedSession(msgs, cwd, undefined, "claude-sonnet-5", false, splitPendingInput(msgs));
+	const pending = splitPendingInput(msgs);
+	const r = T.syncSharedSession(pending.history, cwd, undefined, "claude-sonnet-5", false, pending.interleaved);
 	expect(r.sessionId).toBe("66666666-6666-4666-8666-666666666666");
 	expect(T.getSharedSession().cursor).toBe(4); // history = 4 messages, reminder goes as the prompt
 });
