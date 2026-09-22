@@ -6,13 +6,13 @@ import { buildSessionContext } from "@oh-my-pi/pi-coding-agent/session/session-c
 import type { CompactionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { compact } from "@oh-my-pi/pi-agent-core/compaction";
 import { query, startup, type EffortLevel, type SDKMessage, type SDKUserMessage, type SettingSource, type WarmQuery } from "@anthropic-ai/claude-agent-sdk";
-import type { Base64ImageSource, ContentBlockParam, MessageParam } from "@anthropic-ai/sdk/resources";
+import type { ContentBlockParam, MessageParam } from "@anthropic-ai/sdk/resources";
 import { Text } from "@oh-my-pi/pi-tui";
 import { createSession, deleteSession, repairToolPairing } from "cc-session-io";
 import { appendFileSync, mkdirSync, readdirSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from "fs";
 import { homedir } from "os";
 import { dirname, join } from "path";
-import { PROVIDER_ID, messageContentToText, convertPiMessages } from "./convert.js";
+import { PROVIDER_ID, messageContentToText, convertPiMessages, importMessagesLossless, splitPendingInput, type PendingInput } from "./convert.js";
 import { buildVariantModels, buildModels, STATIC_FALLBACK_IDS, claudeCodeModelId, type ContextWindowMode, type LongContextSettings, resolveModel as _resolveModel } from "./models.js";
 import { MCP_SERVER_NAME, MCP_TOOL_PREFIX, extractSkillsBlock } from "./skills.js";
 import { verifyWrittenSession as _verifyWrittenSession } from "./session-verify.js";
@@ -277,7 +277,7 @@ function convertAndImportMessages(
 	if (repaired.length !== anthropicMessages.length) {
 		debug(`convertAndImportMessages: repairToolPairing ${anthropicMessages.length} → ${repaired.length} msgs`);
 	}
-	if (repaired.length) session.importMessages(repaired);
+	if (repaired.length) importMessagesLossless(session, repaired);
 }
 
 // Pi doesn't pass tool results directly — it appends them to the context and calls
@@ -300,42 +300,6 @@ function extractUserPrompt(messages: Context["messages"]): string | null {
 	if (typeof last.content === "string") return last.content;
 	return messageContentToText(last.content) || "";
 }
-
-/** Extract the last user message as ContentBlockParam[] (preserving images).
- *  Returns null if no images — caller should fall back to string prompt. */
-function extractUserPromptBlocks(messages: Context["messages"]): ContentBlockParam[] | null {
-	const last = messages[messages.length - 1];
-	if (!last || last.role !== "user") return null;
-	if (typeof last.content === "string") {
-		debug(`extractUserPromptBlocks: content is string (length=${last.content.length})`);
-		return null;
-	}
-	if (!Array.isArray(last.content)) {
-		debug(`extractUserPromptBlocks: content is ${typeof last.content}`);
-		return null;
-	}
-	debug(`extractUserPromptBlocks: ${last.content.length} blocks, types=${last.content.map((b: any) => b.type).join(",")}`);
-	let hasImage = false;
-	const blocks: ContentBlockParam[] = [];
-	for (const block of last.content) {
-		if (block.type === "text" && block.text) {
-			blocks.push({ type: "text", text: block.text });
-		} else if (block.type === "image") {
-			debug(`image block: mimeType=${(block as any).mimeType}, data length=${((block as any).data ?? "").length}, keys=${Object.keys(block).join(",")}`);
-			if (!(block as any).data || !(block as any).mimeType) {
-				debug(`image block missing data or mimeType, skipping`);
-				continue;
-			}
-			hasImage = true;
-			blocks.push({
-				type: "image",
-				source: { type: "base64", media_type: block.mimeType as Base64ImageSource["media_type"], data: block.data },
-			});
-		}
-	}
-	return hasImage ? blocks : null;
-}
-
 
 function newAssistantOutput(model: Model<any>, text: string, stopReason: AssistantMessage["stopReason"], errorMessage?: string): AssistantMessage {
 	return {
@@ -649,8 +613,16 @@ function syncSharedSession(
 	customToolNameToSdk?: Map<string, string>,
 	modelId?: string,
 	isReentrant = false,
+	pending?: PendingInput,
 ): SyncResult {
-	const priorMessages = messages.slice(0, -1); // everything before the new user prompt
+	// Everything before the new input. With `pending` (provider path) that is all
+	// the user/developer messages after the last assistant turn; without it
+	// (askClaude, tests) the single trailing message.
+	const priorMessages = pending ? pending.history : messages.slice(0, -1);
+	// Input interleaved with tool results: the results go into history and the
+	// input after them, which a count-based resume cannot express.
+	const forceRebuild = pending?.interleaved === true;
+	if (forceRebuild) debug(`syncSharedSession: pending input interleaved with tool results, rebuilding`);
 
 	// A reentrant call (subagent, side query) is decided first, before REUSE can
 	// hand it the parent's session id. It gets a throwaway clean start and never
@@ -672,7 +644,7 @@ function syncSharedSession(
 	// pi-side history rewrites such as /compact and session_tree: without it,
 	// missed = [].slice(cursor) can falsely hit REUSE and resume an unrelated
 	// longer CC session. See issue #25.
-	if (sharedSession && !sharedSession.needsRebuild && priorMessages.length >= sharedSession.cursor) {
+	if (sharedSession && !sharedSession.needsRebuild && !forceRebuild && priorMessages.length >= sharedSession.cursor) {
 		const missed = priorMessages.slice(sharedSession.cursor);
 		const trailingAssistantOnly =
 			missed.length === 1 && (missed[0] as { role?: string }).role === "assistant";
@@ -695,7 +667,7 @@ function syncSharedSession(
 	//     would run Claude Code without --resume, i.e. with NO history at all
 	//     (upstream pi-claude-bridge issues #55 and #62). Fall through to
 	//     REBUILD instead: costs a cache rewrite, never loses the conversation.
-	if (sharedSession && !sharedSession.needsRebuild && priorMessages.length < sharedSession.cursor) {
+	if (sharedSession && !sharedSession.needsRebuild && !forceRebuild && priorMessages.length < sharedSession.cursor) {
 		// Zero priors is never the main conversation once cursor >= 1 (/new
 		// clears the session via session_start): it is a one-shot side request
 		// (memories, commit message, judgment...) routed to this provider.
@@ -1415,21 +1387,27 @@ function takeWarm(key: string): WarmQuery | null {
 	return handle;
 }
 
-/** The trailing user turn as content blocks, or null if there isn't one.
- *  Blocks rather than text so image steers keep their images. */
-function steerBlocks(messages: Context["messages"]): ContentBlockParam[] | null {
-	const blocks = extractUserPromptBlocks(messages);
-	if (blocks) return blocks;
-	const text = extractUserPrompt(messages);
-	return text ? [{ type: "text", text }] : null;
+/** The user/developer messages omp added during this tool round (steers typed
+ *  while a tool ran, harness reminders), as one user turn's blocks, or null.
+ *  Starts past both the last assistant turn and whatever this query already
+ *  delivered, so a repeated callback does not resend them. */
+function steerBlocks(messages: Context["messages"], c: QueryContext): ContentBlockParam[] | null {
+	const { blocks } = splitPendingInput(messages, c.latestCursor);
+	return blocks.length ? (blocks as ContentBlockParam[]) : null;
 }
 
 /** A steer that never made it into CC's session. The cursor has already counted
  *  it, so count-based sync would skip it forever — rebuild instead, which
- *  re-imports the message from omp's context. */
-function steerMissedSession(text: string): void {
-	if (!sharedSession) return;
-	sharedSession = { ...sharedSession, needsRebuild: true };
+ *  re-imports the message from omp's context. Only the main conversation's
+ *  session is marked: a subagent's lost steer is not the parent's. The query
+ *  context keeps the flag too, for a first query that has no session yet. */
+function steerMissedSession(c: QueryContext, text: string): void {
+	if (c !== ctx()) {
+		debug(`provider: steer never reached a reentrant query, not marking the shared session: ${text.slice(0, 60)}`);
+		return;
+	}
+	c.inputMissed = true;
+	if (sharedSession) sharedSession = { ...sharedSession, needsRebuild: true };
 	debug(`provider: steer never reached CC, marked session for rebuild: ${text.slice(0, 60)}`);
 }
 
@@ -1452,7 +1430,7 @@ async function deliverToolResults(
 		const text = steer.map((b) => (b.type === "text" ? b.text : "[image]")).join("\n");
 		if (!c.promptStream) {
 			debug(`WARNING: steer with no prompt stream, dropping: ${text.slice(0, 60)}`);
-			steerMissedSession(text);
+			steerMissedSession(c, text);
 		} else {
 			try {
 				await c.promptStream.push(userMessage(steer, "next"));
@@ -1462,7 +1440,7 @@ async function deliverToolResults(
 				// delivery, so the steer doesn't reach this query. It is still in
 				// omp's context and the cursor already counts it: force a rebuild.
 				debug(`provider: steer push rejected, delivering tool result anyway:`, error);
-				steerMissedSession(text);
+				steerMissedSession(c, text);
 			}
 		}
 	}
@@ -1528,7 +1506,8 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		// active query — a steer typed while a tool ran, drained by omp at the
 		// turn boundary next to the tool result. Written to Claude Code's stdin
 		// BEFORE the tool results are released, so CC sees it this turn.
-		const steer = lastMsgRole === "user" ? steerBlocks(context.messages) : null;
+		// Developer messages (harness reminders) travel the same way, wrapped.
+		const steer = steerBlocks(context.messages, resultCtx);
 		void deliverToolResults(resultCtx, allResults, steer, context.messages.length);
 
 		// Only the main conversation's tool results advance the shared cursor: a
@@ -1540,11 +1519,17 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		return stream;
 	}
 
+	// New input for this call: every user/developer message after the last
+	// assistant turn (a prompt, harness reminders, a steer that missed its query).
+	const pendingInput = splitPendingInput(context.messages);
+
 	// --- Orphaned tool result (e.g. user aborted a tool call) ---
 	// The query is gone but pi still delivered the result. Nothing to do — just
-	// emit end_turn so pi waits for the next real user message.
+	// emit end_turn so pi waits for the next real user message. Unless input is
+	// waiting next to the result (a reminder omp added before it): that goes to
+	// a fresh query, with the result rebuilt into history, instead of vanishing.
 	const lastMsg = context.messages[context.messages.length - 1];
-	if (lastMsg?.role === "toolResult") {
+	if (lastMsg?.role === "toolResult" && (pendingInput.blocks.length === 0 || options?.signal?.aborted)) {
 		debug(`provider: orphaned tool result after abort, emitting end_turn`);
 		if (sharedSession) sharedSession.cursor = Math.max(sharedSession.cursor, context.messages.length);
 		const c = ctx();  // capture current context for the microtask
@@ -1572,17 +1557,21 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	queryCtx.pendingResults.clear();
 	queryCtx.resetTurnState(model);
 	queryCtx.latestCursor = 0;
+	queryCtx.inputMissed = false;
 
 	const { mcpTools, customToolNameToSdk, customToolNameToPi } = resolveMcpTools(context, askClaudeToolName);
 	const cwd = (options as { cwd?: string } | undefined)?.cwd ?? process.cwd();
-	const syncResult = syncSharedSession(context.messages, cwd, customToolNameToSdk, model.id, isReentrant);
+	const syncResult = syncSharedSession(context.messages, cwd, customToolNameToSdk, model.id, isReentrant, pendingInput);
 	const { sessionId: resumeSessionId } = syncResult;
-	const promptBlocks = extractUserPromptBlocks(context.messages);
-	let promptText = extractUserPrompt(context.messages) ?? "";
+	const promptBlocks = pendingInput.blocks.length ? (pendingInput.blocks as ContentBlockParam[]) : null;
+	let promptText = "";
+	if (pendingInput.pendingIndices.length > 1 || context.messages[pendingInput.pendingIndices[0]]?.role === "developer") {
+		debug(`provider: prompt from ${pendingInput.pendingIndices.length} pending message(s): ${pendingInput.pendingIndices.map((i) => `[${i}]${context.messages[i].role}`).join(" ")}${pendingInput.interleaved ? " (interleaved)" : ""}`);
+	}
 
-	// Guard: empty prompt means the last context message isn't a user message.
+	// Guard: no user or developer content after the last assistant turn.
 	// This should never happen with per-query state — dump diagnostics if it does.
-	if (!promptText && !promptBlocks) {
+	if (!promptBlocks) {
 		diagDump("empty_prompt", {
 			contextLength: context.messages.length,
 			lastMsgRole: lastMsg?.role,
@@ -1699,7 +1688,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		`model=${cliModel} msgs=${context.messages.length} tools=${mcpTools.length}`,
 		`resume=${resumeSessionId?.slice(0, 8) ?? "none"} effort=${effort ?? "default"} reasoning=${options?.reasoning ?? "none"}`,
 		`appendSys=${appendSystemPrompt} sysPrompt=${hostOnlyPrompt ? "host" : "preset"} settings=${settingSources ? JSON.stringify(settingSources) : "all"} strictMcp=${strictMcpConfigEnabled}`,
-		`prompt=${promptText.slice(0, 60)}${promptBlocks ? " [+images]" : ""}`);
+		`prompt=${(promptBlocks ? promptBlocks.map((b) => (b.type === "text" ? b.text : `[${b.type}]`)).join(" ") : promptText).slice(0, 60)}`);
 
 	// 3. Start SDK query and claim it for this context
 	let wasAborted = false;
@@ -1767,8 +1756,12 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 				// Spread first: a compaction / tree event that fired while this
 				// query was finishing set needsRebuild on the old object, and
 				// dropping it here silently undid the compaction (upstream #62).
-				debug(`provider: query done, session=${sessionId.slice(0, 8)}, cursor=${cursor}${sharedSession?.needsRebuild ? " needsRebuild kept" : ""}`);
-				sharedSession = { ...sharedSession, sessionId, cursor, cwd };
+				// A steer that never reached CC is in omp's history and counted by the
+				// cursor but not in the JSONL: only a rebuild brings it back. Also on
+				// the first query, when there was no session to mark at the time.
+				const needsRebuild = sharedSession?.needsRebuild || queryCtx.inputMissed;
+				debug(`provider: query done, session=${sessionId.slice(0, 8)}, cursor=${cursor}${sharedSession?.needsRebuild ? " needsRebuild kept" : queryCtx.inputMissed ? " needsRebuild (missed input)" : ""}`);
+				sharedSession = { ...sharedSession, sessionId, cursor, cwd, ...(needsRebuild ? { needsRebuild: true } : {}) };
 			}
 
 

@@ -26,6 +26,9 @@ export class QueryContext {
 	nextHandlerIdx = 0;
 	// Parked stdin generator of the active SDK query; steers are pushed here.
 	promptStream: PromptStream | null = null;
+	// Input omp counted as delivered that never reached CC's stdin (a failed
+	// steer push). The session must be rebuilt from omp's history afterwards.
+	inputMissed = false;
 
 	// Per-turn (reset together)
 	turnOutput: AssistantMessage | null = null;

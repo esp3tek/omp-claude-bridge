@@ -38,7 +38,8 @@
 		"assets"
 	],
 	"scripts": {
-		"test": "node --import tsx --test tests/unit-*.mjs",
+		"test": "bun test tests/*.test.ts && node --import tsx --test tests/unit-*.mjs",
+		"test:bun": "bun test tests/*.test.ts",
 		"test:unit": "node --import tsx --test tests/unit-*.mjs",
 		"typecheck": "tsc --noEmit"
 	},
