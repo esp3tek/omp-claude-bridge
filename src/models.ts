@@ -2,7 +2,22 @@
 // `resolveModel` returns the first partial match, so `opus` resolves to the first-listed opus entry.
 // Extracted from index.ts so tests can import without activating the extension.
 
-export const MODEL_IDS_IN_ORDER = ["claude-fable-5", "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-5", "claude-sonnet-4-6", "claude-haiku-4-5"];
+// Models learned at runtime from Claude Code's own picker (see claude-models.ts).
+// Known ids in the tables below keep their measured policy; anything else that
+// Claude Code lists gets a generic one: 200K default (no long-context
+// surcharge), plus a "-1m" variant when Claude Code offers the model with [1m].
+export const DYNAMIC_WINDOWS = new Map<string, { oneM: boolean }>();
+export function registerDynamicWindows(id: string, caps: { oneM: boolean }): void {
+	if (!MODEL_IDS_IN_ORDER.includes(id)) DYNAMIC_WINDOWS.set(id, caps);
+}
+
+// Registered when Claude Code's own list is not available yet (first launch
+// before discovery, or discovery failing): the families the current Claude
+// Code picker offers. Everything in MODEL_IDS_IN_ORDER keeps its window policy
+// so it still works if discovery lists it or a role references it explicitly.
+export const STATIC_FALLBACK_IDS = ["claude-fable-5-1", "claude-opus-5", "claude-sonnet-5", "claude-haiku-4-5"];
+
+export const MODEL_IDS_IN_ORDER = ["claude-fable-5-1", "claude-fable-5", "claude-opus-5", "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-5", "claude-sonnet-4-6", "claude-haiku-4-5"];
 
 // Workaround for models that ship without a thinkingLevelMap. Sonnet 5 and
 // Sonnet 4.6 have no map, so getSupportedThinkingLevels hides xhigh (it's
@@ -16,8 +31,8 @@ const DEFAULT_THINKING_LEVEL_MAPS: Record<string, Record<string, string>> = {
 // Project pi-ai's model entries down to the fields OMP's registerProvider expects,
 // and keep MODEL_IDS_IN_ORDER ordering. IDs missing from pi-ai are silently dropped.
 // Context-dependent display labels are applied after plan/long-context config is known.
-export function buildModels<T extends { id: string; [key: string]: any }>(piAiModels: T[]) {
-	return MODEL_IDS_IN_ORDER
+export function buildModels<T extends { id: string; [key: string]: any }>(piAiModels: T[], ids: readonly string[] = MODEL_IDS_IN_ORDER) {
+	return ids
 		.map((id) => piAiModels.find((m) => m.id === id))
 		.filter((m) => m != null)
 		// Forward thinkingLevelMap so per-model overrides (e.g. opus-4-7 mapping
@@ -69,6 +84,8 @@ export function resolveClaudeCodeRuntimeModel(modelId: string, settings: LongCon
 
 function resolveAutoRuntimeModel(modelId: string, settings: LongContextSettings): ClaudeCodeRuntimeModel {
 	switch (modelId) {
+		case "claude-opus-5":
+			return { cliModelId: "claude-opus-5[1m]", contextWindow: ONE_M_CONTEXT };
 		case "claude-opus-4-8":
 			return { cliModelId: "claude-opus-4-8[1m]", contextWindow: ONE_M_CONTEXT };
 		case "claude-opus-4-7":
@@ -80,6 +97,8 @@ function resolveAutoRuntimeModel(modelId: string, settings: LongContextSettings)
 				contextWindow: useOneM ? ONE_M_CONTEXT : TWO_HUNDRED_K_CONTEXT,
 			};
 		}
+		case "claude-fable-5-1":
+			return { cliModelId: "claude-fable-5-1", contextWindow: TWO_HUNDRED_K_CONTEXT };
 		case "claude-fable-5":
 			return { cliModelId: "claude-fable-5", contextWindow: TWO_HUNDRED_K_CONTEXT };
 		case "claude-sonnet-5":
@@ -92,19 +111,23 @@ function resolveAutoRuntimeModel(modelId: string, settings: LongContextSettings)
 		case "claude-haiku-4-5":
 			return { cliModelId: "claude-haiku-4-5", contextWindow: TWO_HUNDRED_K_CONTEXT };
 		default:
-			console.error(`claude-bridge: encountered model ${modelId} with no known context size, defaulting to 200K`);
+			if (!DYNAMIC_WINDOWS.has(modelId)) console.error(`claude-bridge: encountered model ${modelId} with no known context size, defaulting to 200K`);
 			return { cliModelId: modelId, contextWindow: TWO_HUNDRED_K_CONTEXT };
 	}
 }
 
 function resolveForcedOneMRuntimeModel(modelId: string): ClaudeCodeRuntimeModel | null {
 	switch (modelId) {
+		case "claude-opus-5":
+			return { cliModelId: "claude-opus-5[1m]", contextWindow: ONE_M_CONTEXT };
 		case "claude-opus-4-8":
 			return { cliModelId: "claude-opus-4-8[1m]", contextWindow: ONE_M_CONTEXT };
 		case "claude-opus-4-7":
 			return { cliModelId: "claude-opus-4-7", contextWindow: ONE_M_CONTEXT };
 		case "claude-opus-4-6":
 			return { cliModelId: "claude-opus-4-6[1m]", contextWindow: ONE_M_CONTEXT };
+		case "claude-fable-5-1":
+			return { cliModelId: "claude-fable-5-1[1m]", contextWindow: ONE_M_CONTEXT };
 		case "claude-fable-5":
 			return { cliModelId: "claude-fable-5[1m]", contextWindow: ONE_M_CONTEXT };
 		case "claude-sonnet-5":
@@ -113,20 +136,29 @@ function resolveForcedOneMRuntimeModel(modelId: string): ClaudeCodeRuntimeModel 
 			return { cliModelId: "claude-sonnet-4-6[1m]", contextWindow: ONE_M_CONTEXT };
 		case "claude-haiku-4-5":
 			return null;
-		default:
-			console.error(`claude-bridge: encountered model ${modelId} with no known 1M runtime, hiding it`);
-			return null;
+		default: {
+			const dyn = DYNAMIC_WINDOWS.get(modelId);
+			if (dyn) return dyn.oneM ? { cliModelId: `${modelId}[1m]`, contextWindow: ONE_M_CONTEXT } : null;
+			// A "-1m" variant id only exists because discovery offered it; after a
+			// restart omp serves that id from its model cache without re-running
+			// discovery, so trust the id rather than hide the model.
+			return { cliModelId: `${modelId}[1m]`, contextWindow: ONE_M_CONTEXT };
+		}
 	}
 }
 
 function resolveForcedTwoHundredKRuntimeModel(modelId: string): ClaudeCodeRuntimeModel | null {
 	switch (modelId) {
+		case "claude-opus-5":
+			return { cliModelId: "claude-opus-5", contextWindow: TWO_HUNDRED_K_CONTEXT };
 		case "claude-opus-4-8":
 			return { cliModelId: "claude-opus-4-8", contextWindow: TWO_HUNDRED_K_CONTEXT };
 		case "claude-opus-4-7":
 			return null;
 		case "claude-opus-4-6":
 			return { cliModelId: "claude-opus-4-6", contextWindow: TWO_HUNDRED_K_CONTEXT };
+		case "claude-fable-5-1":
+			return { cliModelId: "claude-fable-5-1", contextWindow: TWO_HUNDRED_K_CONTEXT };
 		case "claude-fable-5":
 			return { cliModelId: "claude-fable-5", contextWindow: TWO_HUNDRED_K_CONTEXT };
 		case "claude-sonnet-5":
@@ -136,6 +168,7 @@ function resolveForcedTwoHundredKRuntimeModel(modelId: string): ClaudeCodeRuntim
 		case "claude-haiku-4-5":
 			return { cliModelId: "claude-haiku-4-5", contextWindow: TWO_HUNDRED_K_CONTEXT };
 		default:
+			if (DYNAMIC_WINDOWS.has(modelId)) return { cliModelId: modelId, contextWindow: TWO_HUNDRED_K_CONTEXT };
 			console.error(`claude-bridge: encountered model ${modelId} with no known 200K runtime, hiding it`);
 			return null;
 	}
@@ -193,7 +226,7 @@ export function buildVariantModels<T extends { id: string; name: string; context
 		// Unknown model (not in the model tables): keep one default-path entry.
 		// Done before the forced-resolver probes below, which log "hiding it" on
 		// unknown ids — misleading noise for a model we actually keep.
-		if (!MODEL_IDS_IN_ORDER.includes(m.id)) {
+		if (!MODEL_IDS_IN_ORDER.includes(m.id) && !DYNAMIC_WINDOWS.has(m.id)) {
 			const runtimeModel = resolveClaudeCodeRuntimeModel(m.id, settings);
 			if (runtimeModel != null) result.push({ ...m, contextWindow: runtimeModel.contextWindow, name: variantName(m.name, runtimeModel.contextWindow) });
 			continue;

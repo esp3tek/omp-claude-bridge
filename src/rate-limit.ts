@@ -31,3 +31,37 @@ export function rateLimitNotice(
 	}
 	return null;
 }
+
+/** Thrown when the Claude subscription quota is exhausted, so the host can
+ *  classify the turn as a 429 usage-limit error and walk its fallback chain
+ *  instead of ending the turn as a normal stop. */
+export class ClaudeUsageLimitError extends Error {
+	readonly status = 429;
+	constructor(message: string) {
+		super(message);
+		this.name = "ClaudeUsageLimitError";
+	}
+}
+
+/** SDK `resetsAt` is epoch seconds; tolerate epoch milliseconds and ISO strings. */
+function resetsAtToMs(resetsAt: RateLimitInfo["resetsAt"]): number | undefined {
+	if (resetsAt === undefined || resetsAt === null) return undefined;
+	if (typeof resetsAt === "number") return resetsAt < 1e12 ? resetsAt * 1000 : resetsAt;
+	const ms = new Date(resetsAt).getTime();
+	return Number.isFinite(ms) ? ms : undefined;
+}
+
+/** Builds a 429-style usage-limit error for a `rejected` rate-limit event, or
+ *  null when the event is not a hard rejection. The message carries the
+ *  `retry-after-ms=` hint the host parses for provider-timed resets. */
+export function usageLimitError(info: RateLimitInfo | undefined, nowMs: number = Date.now()): ClaudeUsageLimitError | null {
+	if (info?.status !== "rejected") return null;
+	const resetMs = resetsAtToMs(info.resetsAt);
+	const window = info.rateLimitType ?? "unknown";
+	let message = `429 usage_limit_reached: Claude subscription ${window} quota exhausted`;
+	if (resetMs !== undefined) {
+		const retryAfterMs = Math.max(0, Math.round(resetMs - nowMs));
+		message += ` — resets at ${new Date(resetMs).toISOString()} retry-after-ms=${retryAfterMs}`;
+	}
+	return new ClaudeUsageLimitError(message);
+}

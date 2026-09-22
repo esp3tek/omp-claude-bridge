@@ -11,7 +11,7 @@
 <img alt="Oh My Pi extension" src="https://img.shields.io/badge/Oh%20My%20Pi-extension-6E56CF">
 <img alt="Claude Agent SDK" src="https://img.shields.io/badge/Claude%20Code-Agent%20SDK-D97757">
 <img alt="TypeScript" src="https://img.shields.io/badge/TypeScript-strict-3178C6?logo=typescript&logoColor=white">
-<a href="https://github.com/DevVig/omp-claude-bridge/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/DevVig/omp-claude-bridge/actions/workflows/ci.yml/badge.svg"></a>
+<a href="https://github.com/esp3tek/omp-claude-bridge/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/esp3tek/omp-claude-bridge/actions/workflows/ci.yml/badge.svg"></a>
 <img alt="PRs welcome" src="https://img.shields.io/badge/PRs-welcome-brightgreen.svg">
 </p>
 
@@ -27,6 +27,80 @@ Authentication and billing run through Claude Code and your Anthropic subscripti
 <a href="assets/claude-bridge1.png"><img src="assets/claude-bridge1.png" width="49%"></a>&nbsp;
 <a href="assets/claude-bridge2.png"><img src="assets/claude-bridge2.png" width="49%"></a>
 </div>
+
+## About this fork
+
+This is a fork of [DevVig/omp-claude-bridge](https://github.com/DevVig/omp-claude-bridge) 0.8.1,
+itself a port of [elidickinson/pi-claude-bridge](https://github.com/elidickinson/pi-claude-bridge).
+Upstream's omp port has not been updated since July 2026, so the fixes below live here.
+
+**Ported from `pi-claude-bridge` 0.7.0/0.8.0** (they exist upstream for Pi, not in the 0.8.1 omp port):
+
+- Mid-turn steering: the prompt is a parked stdin generator, so a steer typed while a tool runs
+  reaches Claude Code in the same turn instead of being replayed afterwards. Replaces the
+  deferred-replay loop, which was the root of upstream issue #55.
+- omp's JSON schemas are served to Claude Code verbatim instead of going through Zod, which
+  flattened nested objects and dropped `anyOf`/`const` (upstream #44). Tool results are paired by
+  Claude Code's own `tool_use` id rather than call order.
+- A `tool_use` naming a tool we do not serve (the model reaching for a native `bash`/`Edit`) is no
+  longer forwarded to omp, which used to execute it for real while Claude Code rejected it.
+- An exhausted subscription surfaces as a 429 so omp walks its fallback chain (upstream #58).
+- The provider is re-registered when a subagent's teardown removes it (upstream #91).
+
+**New here:**
+
+- **omp's own system prompt and tool descriptions reach the model.** Claude Code truncates every
+  MCP tool description at 2048 characters, so omp's `edit`, `task`, `todo`, `hub` and `eval`
+  descriptions arrived cut off, examples first to go. Long descriptions are now condensed to fit
+  and their full text goes into the system prompt, together with omp's own prompt (tool inventory,
+  todo/task workflow, delegation rules). `provider.systemPrompt: "host"` drops Claude Code's
+  preset entirely and runs on omp's prompt alone.
+- **The child is isolated from `~/.claude`** (`settingSources: ["project"]`): the user's plugins,
+  hooks and skills no longer load on every turn.
+- **Context is never silently lost.** A main-thread context shorter than the session cursor now
+  rebuilds the Claude Code session instead of starting clean, which used to run a turn with no
+  history at all (upstream #55/#62 reached by a different route). Reentrant calls never rebuild
+  or adopt the shared session.
+- **Compaction is left to omp.** Taking it over runs inside an extension handler the host aborts
+  at 30 seconds — not enough for a real context, and a discarded takeover left the session
+  uncompacted. Declining hands the summary to omp's normal provider path, which has no deadline.
+  Still available with `provider.compactTakeover: true`.
+- **The next Claude Code process is pre-warmed** between turns (measured: ~1.5 s less per message).
+- **Claude subscription quota reaches omp** (`omp usage`, the status bar, `retry.usageAwareFallback`)
+  by reading Claude Code's own OAuth token.
+- **The model list comes from Claude Code's picker** (`supportedModels()`), so a model the installed
+  binary and plan actually serve shows up without a code change; the static list is the fallback.
+  Adds Claude Fable 5.1 and Opus 5.
+- **Historical `thinking` blocks are not replayed** by default (`provider.replayThinking`), which
+  shrinks rebuilt sessions considerably.
+
+**Known interaction with Opus 5:** after omp compacts with `snapcompact`, the archive it injects
+carries a preamble describing how to reconstruct a verbatim transcript including the assistant's
+reasoning. Opus 5's classifier reads that as duplicating model outputs and refuses the turn
+(`apiRefusalCategory: reasoning_extraction`). It is not about the archive's contents — the one we
+traced held no reasoning at all. Remove `snapcompact` from `compaction.methodOrder`, and clear
+frames already archived with `/shake images`.
+
+## What this extension reads
+
+Worth knowing before you install it, because none of it is obvious from the outside:
+
+- **Your Claude Code OAuth token.** The quota reporter reads
+  `<CLAUDE_CONFIG_DIR>/.credentials.json` — the session Claude Code already owns — and sends it
+  as a bearer token to `api.anthropic.com/api/oauth/usage` so omp can show your 5h / 7d windows
+  and reserve quota for `retry.usageAwareFallback`. The token is never written to disk or to the
+  debug log, which records only percentages. Nothing else in the extension touches credentials:
+  authentication and billing run through Claude Code itself.
+- **Your conversation, rewritten into a Claude Code session file.** The bridge does not send
+  history over an API; it writes omp's history into `~/.claude/projects/<project>/<uuid>.jsonl`
+  and resumes it, the same place Claude Code keeps its own sessions.
+- **`AGENTS.md` / `CLAUDE.md` and omp's system prompt**, forwarded to the model so it works by
+  your project's rules. With `provider.settingSources` you control which Claude Code settings the
+  child loads; by default it no longer loads your user-level plugins, hooks and skills.
+
+With `CLAUDE_BRIDGE_DEBUG=1` the logs under `~/.omp/agent/` contain the first 60 characters of
+each prompt and truncated tool results — your work, on your disk. They are pruned automatically
+but never leave the machine.
 
 ## Table of contents
 
@@ -56,7 +130,7 @@ Authentication and billing run through Claude Code and your Anthropic subscripti
 ## Install
 
 ```bash
-omp plugin install git:github.com/DevVig/omp-claude-bridge
+omp plugin install git:github.com/esp3tek/omp-claude-bridge
 ```
 
 <details>
@@ -64,10 +138,10 @@ omp plugin install git:github.com/DevVig/omp-claude-bridge
 
 ```bash
 # From the full HTTPS URL
-omp plugin install https://github.com/DevVig/omp-claude-bridge
+omp plugin install https://github.com/esp3tek/omp-claude-bridge
 
 # From a local checkout (great for hacking on it)
-git clone https://github.com/DevVig/omp-claude-bridge.git
+git clone https://github.com/esp3tek/omp-claude-bridge.git
 omp plugin install ./omp-claude-bridge
 ```
 
@@ -237,7 +311,7 @@ When filing a session-resume bug (e.g. "No conversation found"), the `syncResult
 ## Development
 
 ```bash
-git clone https://github.com/DevVig/omp-claude-bridge.git
+git clone https://github.com/esp3tek/omp-claude-bridge.git
 cd omp-claude-bridge
 bun install
 

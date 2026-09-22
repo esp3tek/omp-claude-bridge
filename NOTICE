@@ -25,5 +25,34 @@ Derivative work
       forces the Claude Code context window across every model, hiding models
       that have no runtime for the selected window.
 
+Second derivative work
+-----------------------
+  omp-claude-bridge (this fork)
+  Copyright (c) 2026 Yuri Vidal (https://github.com/esp3tek)
+  Licensed under the MIT License.
+
+  Changes from DevVig/omp-claude-bridge 0.8.1:
+    - Session sync: a main-thread context shorter than the session cursor
+      rebuilds instead of starting clean, so a turn can no longer run with no
+      history at all; reentrant (subagent) calls never rebuild or adopt the
+      shared session.
+    - Forwards omp's own system prompt and the full text of tool descriptions
+      Claude Code truncates at 2048 characters, with an optional host-only
+      prompt mode; isolates the child from ~/.claude settings.
+    - Serves omp's JSON schemas to Claude Code verbatim and pairs tool results
+      by Claude Code's tool_use id (ported from pi-claude-bridge).
+    - Mid-turn steering through a parked stdin generator (ported from
+      pi-claude-bridge 0.7.0), replacing the deferred-replay loop.
+    - Pre-warms the next Claude Code process between turns.
+    - Reports Claude subscription quota (5h / 7d windows) to omp.
+    - Builds the model list from Claude Code's own picker, with a static
+      fallback; adds Claude Fable 5.1 and Opus 5.
+    - Leaves compaction summaries to omp instead of taking them over inside an
+      extension handler the host aborts at 30 seconds.
+    - Re-registers the provider after a finished subagent tears down the
+      extension source's runtime providers.
+    - Surfaces an exhausted subscription as a 429 so omp walks its fallback
+      chain, and names safeguard refusals instead of retrying them blindly.
+
 The original MIT copyright notice is retained in the LICENSE file, as required
 by the MIT License.

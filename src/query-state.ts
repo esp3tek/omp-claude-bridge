@@ -8,6 +8,7 @@
 
 import type { AssistantMessage, AssistantMessageEventStream, Model } from "@oh-my-pi/pi-coding-agent/extensibility/legacy-pi-ai-shim";
 import type { McpResult } from "./extract-tool-results.js";
+import type { PromptStream } from "./prompt-stream.js";
 
 export interface PendingToolCall {
 	toolName: string;
@@ -23,7 +24,8 @@ export class QueryContext {
 	pendingResults = new Map<string, McpResult>();
 	turnToolCallIds: string[] = [];
 	nextHandlerIdx = 0;
-	deferredUserMessages: string[] = [];
+	// Parked stdin generator of the active SDK query; steers are pushed here.
+	promptStream: PromptStream | null = null;
 
 	// Per-turn (reset together)
 	turnOutput: AssistantMessage | null = null;
@@ -68,7 +70,6 @@ export function pushContext(): void {
 export function popContext(): void {
 	if (contextStack.length === 0) throw new Error("popContext() called with empty stack");
 	const parent = contextStack[contextStack.length - 1];
-	parent.deferredUserMessages.push(..._ctx.deferredUserMessages);
 	_ctx = contextStack.pop()!;
 }
 

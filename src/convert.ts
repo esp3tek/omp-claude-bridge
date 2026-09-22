@@ -44,15 +44,24 @@ export function messageContentToText(
 	return hasText ? parts.join("\n") : "";
 }
 
+export type ThinkingReplay = "last" | "all" | "none";
+
 /** Convert OMP message array to Anthropic API format. */
 export function convertPiMessages(
 	messages: PiMessage[],
 	customToolNameToSdk?: Map<string, string>,
-): { anthropicMessages: SessionMessage[]; sanitizedIds: Map<string, string> } {
+	thinkingReplay: ThinkingReplay = "last",
+): { anthropicMessages: SessionMessage[]; sanitizedIds: Map<string, string>; droppedThinking: number } {
 	const anthropicMessages = [];
 	const sanitizedIds = new Map();
+	let droppedThinking = 0;
+	// Only the turn being continued needs its thinking blocks; the API accepts
+	// earlier assistant turns without them.
+	let lastAssistantIndex = -1;
+	for (let i = 0; i < messages.length; i++) if (messages[i].role === "assistant") lastAssistantIndex = i;
 
-	for (const msg of messages) {
+	for (let msgIndex = 0; msgIndex < messages.length; msgIndex++) {
+		const msg = messages[msgIndex];
 		if (msg.role === "user") {
 			if (typeof msg.content === "string") {
 				anthropicMessages.push({ role: "user", content: msg.content || "[empty]" });
@@ -77,8 +86,14 @@ export function convertPiMessages(
 				} else if (block.type === "thinking") {
 					const sig = block.thinkingSignature;
 					const isAnthropicProvider = msg.provider === PROVIDER_ID || msg.api === "anthropic";
-					if (isAnthropicProvider && sig) {
+					// Historical reasoning is optional for the API, is a large share of a
+					// long context's tokens, and replaying a whole session of it back to
+					// Opus 5 trips its "[reasoning_extraction]" safeguard.
+					const keepThinking = thinkingReplay === "all" || (thinkingReplay === "last" && msgIndex === lastAssistantIndex);
+					if (isAnthropicProvider && sig && keepThinking) {
 						blocks.push({ type: "thinking", thinking: block.thinking ?? "", signature: sig });
+					} else if (isAnthropicProvider && sig) {
+						droppedThinking++;
 					}
 				} else if (block.type === "toolCall") {
 					const toolName = mapPiToolNameToSdk(block.name, customToolNameToSdk);
@@ -96,5 +111,5 @@ export function convertPiMessages(
 		}
 	}
 
-	return { anthropicMessages, sanitizedIds };
+	return { anthropicMessages, sanitizedIds, droppedThinking };
 }
