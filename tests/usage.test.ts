@@ -55,14 +55,17 @@ test("events without usable numbers are ignored", () => {
 
 test("unifiedWindows (fraction of 1) records every window at once", () => {
   __resetUsageWindows();
-  // Verbatim shape from Claude Code 2.1.278.
+  // Verbatim shape from Claude Code 2.1.278, with the epoch-second reset times
+  // made relative so the test does not expire with the clock.
+  const fiveHourReset = Math.floor(Date.now() / 1000) + 3 * 3600;
+  const sevenDayReset = Math.floor(Date.now() / 1000) + 5 * 86400;
   const ok = recordRateLimitEvent({
     status: "allowed",
-    resetsAt: 1790107800,
+    resetsAt: fiveHourReset,
     rateLimitType: "five_hour",
     unifiedWindows: {
-      five_hour: { utilization: 0.21, resetsAt: 1790107800 },
-      seven_day: { utilization: 0.27, resetsAt: 1790596800 },
+      five_hour: { utilization: 0.21, resetsAt: fiveHourReset },
+      seven_day: { utilization: 0.27, resetsAt: sevenDayReset },
     },
   });
   expect(ok).toBe(true);
@@ -70,7 +73,7 @@ test("unifiedWindows (fraction of 1) records every window at once", () => {
   expect(r.limits).toHaveLength(2);
   expect(r.limits.find((l) => l.window.id === "five_hour")!.amount.used).toBeCloseTo(21);
   expect(r.limits.find((l) => l.window.id === "seven_day")!.amount.used).toBeCloseTo(27);
-  expect(r.limits.find((l) => l.window.id === "five_hour")!.window.resetsAt).toBe(1790107800 * 1000);
+  expect(r.limits.find((l) => l.window.id === "five_hour")!.window.resetsAt).toBe(fiveHourReset * 1000);
 });
 
 test("a unifiedWindows value outside 0..1 is discarded, not reported as a percentage", () => {

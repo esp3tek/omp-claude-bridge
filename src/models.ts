@@ -15,9 +15,9 @@ export function registerDynamicWindows(id: string, caps: { oneM: boolean }): voi
 // before discovery, or discovery failing): the families the current Claude
 // Code picker offers. Everything in MODEL_IDS_IN_ORDER keeps its window policy
 // so it still works if discovery lists it or a role references it explicitly.
-export const STATIC_FALLBACK_IDS = ["claude-fable-5-1", "claude-opus-5", "claude-sonnet-5", "claude-haiku-4-5"];
+export const STATIC_FALLBACK_IDS = ["claude-fable-5-1", "claude-opus-5-5", "claude-opus-5", "claude-sonnet-5", "claude-haiku-4-5"];
 
-export const MODEL_IDS_IN_ORDER = ["claude-fable-5-1", "claude-fable-5", "claude-opus-5", "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-5", "claude-sonnet-4-6", "claude-haiku-4-5"];
+export const MODEL_IDS_IN_ORDER = ["claude-fable-5-1", "claude-fable-5", "claude-opus-5-5", "claude-opus-5", "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-5", "claude-sonnet-4-6", "claude-haiku-4-5"];
 
 // Workaround for models that ship without a thinkingLevelMap. Sonnet 5 and
 // Sonnet 4.6 have no map, so getSupportedThinkingLevels hides xhigh (it's
@@ -84,6 +84,8 @@ export function resolveClaudeCodeRuntimeModel(modelId: string, settings: LongCon
 
 function resolveAutoRuntimeModel(modelId: string, settings: LongContextSettings): ClaudeCodeRuntimeModel {
 	switch (modelId) {
+		case "claude-opus-5-5":
+			return { cliModelId: "claude-opus-5-5[1m]", contextWindow: ONE_M_CONTEXT };
 		case "claude-opus-5":
 			return { cliModelId: "claude-opus-5[1m]", contextWindow: ONE_M_CONTEXT };
 		case "claude-opus-4-8":
@@ -111,13 +113,16 @@ function resolveAutoRuntimeModel(modelId: string, settings: LongContextSettings)
 		case "claude-haiku-4-5":
 			return { cliModelId: "claude-haiku-4-5", contextWindow: TWO_HUNDRED_K_CONTEXT };
 		default:
-			if (!DYNAMIC_WINDOWS.has(modelId)) console.error(`claude-bridge: encountered model ${modelId} with no known context size, defaulting to 200K`);
+			// Same reasoning as the forced-200K resolver: an id these tables do not
+			// know is a newer model, and 200K is the safe default for it.
 			return { cliModelId: modelId, contextWindow: TWO_HUNDRED_K_CONTEXT };
 	}
 }
 
 function resolveForcedOneMRuntimeModel(modelId: string): ClaudeCodeRuntimeModel | null {
 	switch (modelId) {
+		case "claude-opus-5-5":
+			return { cliModelId: "claude-opus-5-5[1m]", contextWindow: ONE_M_CONTEXT };
 		case "claude-opus-5":
 			return { cliModelId: "claude-opus-5[1m]", contextWindow: ONE_M_CONTEXT };
 		case "claude-opus-4-8":
@@ -149,6 +154,8 @@ function resolveForcedOneMRuntimeModel(modelId: string): ClaudeCodeRuntimeModel 
 
 function resolveForcedTwoHundredKRuntimeModel(modelId: string): ClaudeCodeRuntimeModel | null {
 	switch (modelId) {
+		case "claude-opus-5-5":
+			return { cliModelId: "claude-opus-5-5", contextWindow: TWO_HUNDRED_K_CONTEXT };
 		case "claude-opus-5":
 			return { cliModelId: "claude-opus-5", contextWindow: TWO_HUNDRED_K_CONTEXT };
 		case "claude-opus-4-8":
@@ -168,9 +175,13 @@ function resolveForcedTwoHundredKRuntimeModel(modelId: string): ClaudeCodeRuntim
 		case "claude-haiku-4-5":
 			return { cliModelId: "claude-haiku-4-5", contextWindow: TWO_HUNDRED_K_CONTEXT };
 		default:
-			if (DYNAMIC_WINDOWS.has(modelId)) return { cliModelId: modelId, contextWindow: TWO_HUNDRED_K_CONTEXT };
-			console.error(`claude-bridge: encountered model ${modelId} with no known 200K runtime, hiding it`);
-			return null;
+			// An unknown id is a model Claude Code offered that these tables predate.
+			// The bare id IS the 200K request, so it always has a runtime — and the
+			// id can reach us in a process that never ran discovery (the host caches
+			// the model list for 24 h), where DYNAMIC_WINDOWS is empty. Hiding it
+			// there dropped a freshly released model from a session that had just
+			// listed it.
+			return { cliModelId: modelId, contextWindow: TWO_HUNDRED_K_CONTEXT };
 	}
 }
 
