@@ -51,6 +51,10 @@ Second derivative work
       extension handler the host aborts at 30 seconds.
     - Re-registers the provider after a finished subagent tears down the
       extension source's runtime providers.
+    - Reports subscription quota from the SDK's own rate-limit events, without
+      reading credentials or calling Anthropic directly, and warns when
+      ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN / ANTHROPIC_API_KEY would send
+      the child somewhere else.
     - Surfaces an exhausted subscription as a 429 so omp walks its fallback
       chain, and names safeguard refusals instead of retrying them blindly.
 

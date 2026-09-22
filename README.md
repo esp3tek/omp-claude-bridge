@@ -81,27 +81,37 @@ reasoning. Opus 5's classifier reads that as duplicating model outputs and refus
 traced held no reasoning at all. Remove `snapcompact` from `compaction.methodOrder`, and clear
 frames already archived with `/shake images`.
 
-## What this extension reads
+## How it reaches Claude, and why that matters
 
-Worth knowing before you install it, because none of it is obvious from the outside:
+Anthropic lets you use a Claude subscription from the Agent SDK, which runs Claude Code itself.
+It does not let you take the OAuth credential Claude Code holds and drive the API with it from
+somewhere else. This extension exists to stay on the right side of that line, so the line is
+drawn in the code rather than in a promise:
 
-- **Your Claude Code OAuth token.** The quota reporter reads
-  `<CLAUDE_CONFIG_DIR>/.credentials.json` — the session Claude Code already owns — and sends it
-  as a bearer token to `api.anthropic.com/api/oauth/usage` so omp can show your 5h / 7d windows
-  and reserve quota for `retry.usageAwareFallback`. The token is never written to disk or to the
-  debug log, which records only percentages. Nothing else in the extension touches credentials:
-  authentication and billing run through Claude Code itself.
-- **Your conversation, rewritten into a Claude Code session file.** The bridge does not send
-  history over an API; it writes omp's history into `~/.claude/projects/<project>/<uuid>.jsonl`
-  and resumes it, the same place Claude Code keeps its own sessions.
-- **`AGENTS.md` / `CLAUDE.md` and omp's system prompt**, forwarded to the model so it works by
-  your project's rules. With `provider.settingSources` you control which Claude Code settings the
-  child loads; by default it no longer loads your user-level plugins, hooks and skills.
+- **Every request to Anthropic is made by Claude Code**, spawned through the official
+  [`@anthropic-ai/claude-agent-sdk`](https://github.com/anthropics/claude-agent-sdk-typescript).
+  Authentication, billing and quota are Claude Code's, exactly as if you had typed into it.
+- **The extension never reads, stores, forwards or inspects a credential.** It does not open
+  `.credentials.json`, sets no `Authorization` header, and makes no network request of its own —
+  there is no `fetch` in the source outside the SDK. Quota reporting is built from the
+  `rate_limit_event` messages the SDK already delivers during a turn (see `src/usage.ts`).
+- **It warns instead of going along with a redirect.** `ANTHROPIC_BASE_URL`,
+  `ANTHROPIC_AUTH_TOKEN` and `ANTHROPIC_API_KEY` in your environment are inherited by the child
+  and change where its requests go or what pays for them; the bridge says so once per session
+  rather than letting subscription traffic quietly leave Anthropic.
 
-With `CLAUDE_BRIDGE_DEBUG=1` the logs under `~/.omp/agent/` contain the first 60 characters of
-each prompt and truncated tool results — your work, on your disk. They are pruned automatically
-but never leave the machine.
+What it does do is shape the session Claude Code works from: it writes omp's conversation into a
+Claude Code session file under `~/.claude/projects/<project>/<uuid>.jsonl` and resumes it, serves
+omp's tools over an in-process MCP server, and forwards omp's system prompt and your
+`AGENTS.md` / `CLAUDE.md`. All of that is what the SDK is for.
 
+One consequence of staying inside the SDK: a quota window is unknown until a turn has reported
+it, so a session shows no Claude quota until its first turn finishes, and `omp usage` run as a
+standalone command — a fresh process that never takes a turn — shows none at all.
+
+With `CLAUDE_BRIDGE_DEBUG=1` the logs under `~/.omp/agent/` hold the first 60 characters of each
+prompt and truncated tool results: your work, on your disk, pruned automatically, never sent
+anywhere.
 ## Table of contents
 
 - [Features](#features)

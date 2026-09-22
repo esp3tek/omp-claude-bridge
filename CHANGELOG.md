@@ -47,8 +47,13 @@ Verified against omp 18.2.8 and Claude Code 2.1.278 on Windows.
 - **Pre-warm**: the next Claude Code process is spawned and resumed between turns
   (`provider.prewarm`, measured ~1.5 s less per message). Discarded on rebuild, abort, error,
   compaction, tree navigation and after 10 minutes.
-- **Subscription quota reaches omp** through a `usage` resolver that reads Claude Code's OAuth
-  token, so `omp usage`, the status bar and `retry.usageAwareFallback` see the 5h / 7d windows.
+- **Subscription quota reaches omp** through a `usage` resolver built from the `rate_limit_event`
+  messages the SDK delivers during a turn, so the status bar and `retry.usageAwareFallback` see
+  the 5h / 7d windows. No credential is read and no request is made outside the SDK: a window is
+  simply unknown until a turn has reported it.
+- **A warning when the environment would redirect the child.** `ANTHROPIC_BASE_URL`,
+  `ANTHROPIC_AUTH_TOKEN` and `ANTHROPIC_API_KEY` are inherited by the Claude Code subprocess and
+  change where its requests go or what pays for them; the bridge now says so once per session.
 - **The model list comes from Claude Code's own picker** (`supportedModels()`), cached by omp; the
   static list is the fallback. Adds Claude Fable 5.1 and Opus 5.
 - **`provider.replayThinking`** (default `"last"`): historical `thinking` blocks are no longer

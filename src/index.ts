@@ -23,7 +23,7 @@ import { extractAgentsAppend } from "./agents-md.js";
 import { buildActionSummary, type ToolCallState } from "./askclaude-ui.js";
 import { ClaudeUsageLimitError, rateLimitNotice, usageLimitError } from "./rate-limit.js";
 import { CC_MCP_DESCRIPTION_LIMIT, TOOL_REFERENCE_HEADER, packToolDescription } from "./tool-description.js";
-import { fetchClaudeUsage } from "./usage.js";
+import { buildUsageReport, recordRateLimitEvent } from "./usage.js";
 import { makePromptStream, userMessage, type PromptStream } from "./prompt-stream.js";
 import { createToolServer } from "./mcp-server.js";
 import { fetchClaudeCodeModels, toProviderModels } from "./claude-models.js";
@@ -108,6 +108,25 @@ function debug(...args: unknown[]) {
 // stderr). Without this, CC's internal view of the world is invisible to us
 // and "No conversation found" / empty-error reports are unactionable.
 let nextCliDebugSeq = 1;
+// Environment variables that change where the Claude Code child sends its
+// requests, or what pays for them.
+const REDIRECTING_ENV = [
+	{ name: "ANTHROPIC_BASE_URL", why: "sends Claude Code's requests to that endpoint instead of Anthropic" },
+	{ name: "ANTHROPIC_AUTH_TOKEN", why: "authenticates Claude Code with that token instead of your Claude Code session" },
+	{ name: "ANTHROPIC_API_KEY", why: "bills Claude Code per token against that key instead of your subscription" },
+];
+let redirectingEnvWarned = false;
+
+function warnAboutRedirectingEnvOnce(): void {
+	if (redirectingEnvWarned) return;
+	redirectingEnvWarned = true;
+	const set = REDIRECTING_ENV.filter((v) => (process.env[v.name] ?? "").trim() !== "");
+	if (!set.length) return;
+	const detail = set.map((v) => `${v.name} ${v.why}`).join("; ");
+	debug(`env: ${detail}`);
+	piUI?.notify(`Claude bridge: ${detail}. Unset it if you meant to run on your Claude Code subscription.`, "warning");
+}
+
 function makeCliDebugOptions(tag: string): { debug?: boolean; debugFile?: string; stderr?: (data: string) => void } {
 	if (!DEBUG) return {};
 	const seq = nextCliDebugSeq++;
@@ -1255,6 +1274,8 @@ async function consumeQuery(
 			case "rate_limit_event": {
 				const info = (message as any).rate_limit_info;
 				debug("consumeQuery: rate_limit_event", JSON.stringify(info).slice(0, 300));
+				// Quota reporting is built from these events alone — see usage.ts.
+				recordRateLimitEvent(info);
 				const notice = rateLimitNotice(info);
 				if (notice) piUI?.notify(notice.message, notice.level);
 				// Hard rejection: abort the turn with a 429 usage-limit error so the host
@@ -1593,6 +1614,14 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// also autocompact would double-flush the prompt cache and races pi's
 	// threshold with CC's, including CC's anti-thrashing guard (issue #8).
 	// Manual /compact in CC still works (we never invoke it).
+	// The child inherits this process's environment, and a few Anthropic
+	// variables silently change where its requests go or how they are billed:
+	// ANTHROPIC_BASE_URL points Claude Code at a different endpoint, and an API
+	// key makes it bill per token instead of using the subscription. Neither is
+	// this extension's doing, but both are worth saying out loud once, because
+	// the whole point of running through Claude Code is that the session stays
+	// the one Anthropic issued it to.
+	warnAboutRedirectingEnvOnce();
 	const childEnv = { ...process.env, ENABLE_CLAUDEAI_MCP_SERVERS: "0", DISABLE_AUTO_COMPACT: "1" };
 	const queryOptions: NonNullable<Parameters<typeof query>[0]["options"]> = {
 		cwd,
@@ -2005,21 +2034,22 @@ export default function (pi: ExtensionAPI) {
 			},
 			// Cast: pi-ai AssistantMessageEventStream diamond dep between pi-coding-agent and pi-agent-core
 			streamSimple: streamSimple as any,
-			// Subscription quota, read with Claude Code's own OAuth token, so
-			// `omp usage`, the status bar and retry.usageAwareFallback see the
-			// 5h / 7d windows instead of only learning about them on a hard 429.
+			// Subscription quota, built from the rate-limit events Claude Code
+			// reports during a turn, so `omp usage`, the status bar and
+			// retry.usageAwareFallback see the 5h / 7d windows instead of only
+			// learning about them on a hard 429. Nothing is fetched and no
+			// credential is read: the SDK is this extension's only channel to the
+			// service. A window stays unknown until a turn has reported it.
 			usage: {
 				id: PROVIDER_ID,
 				supports: () => true,
 				retainLastGoodOnFailure: true,
-				failureBackoffMs: 60_000,
-				async fetchUsage(params: { signal?: AbortSignal }, ctx: { fetch: typeof fetch }) {
-					try {
-						return await fetchClaudeUsage(PROVIDER_ID, ctx.fetch as any, params.signal, debug);
-					} catch (err) {
-						debug(`usage: fetch failed: ${err instanceof Error ? err.message : String(err)}`);
-						return null;
-					}
+				async fetchUsage() {
+					const report = buildUsageReport(PROVIDER_ID);
+					debug(report
+						? `usage: ${report.limits.map((l) => `${l.window.id}=${l.amount.used}%`).join(" ")}`
+						: "usage: no window reported yet");
+					return report as any;
 				},
 			},
 		} as any);
