@@ -4,6 +4,37 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.5] - 2026-09-24
+
+### Fixed
+- **Subagent lifecycle events no longer clear the main conversation.** Ownership
+  follows the main runner's `ctx.sessionManager` object, not its mutable session
+  ID or file. Child start/shutdown/switch/branch/compact/tree events preserve the
+  shared Claude session, cursor, rebuild flags, UI and prewarmed process.
+  Child shutdown still re-registers the owning provider callback after host
+  teardown; real `/new`, session switches, branches and shutdown still reset it.
+- **Idle recap no longer rebuilds the main transcript twice.** OMP's explicit
+  `options.sessionId` side-channel namespace (`:side:`), also used by `/btw`,
+  routes the request to a private query context and ephemeral history snapshot.
+  SDK persistence is disabled; snapshots are removed on completion, abort and
+  error. The main cursor, JSONL and prewarm remain untouched, even when a real
+  turn starts while the recap is pending. Copied tool results in a side snapshot
+  cannot release the main query's MCP handlers.
+- Late query finalizers cannot restore a session or prewarm invalidated by a
+  real lifecycle transition. OMP emits shutdown before aborting the agent.
+  Late child teardown also cannot reclaim the released provider owner.
+
+### Tests
+- Added provider-level regressions for side-channel drift, overlapping recap and
+  main turns, failure/abort cleanup, textual false positives, tool-result
+  isolation, child lifecycle events, real transitions and shutdown races.
+
+### Documentation
+- Documented the OMP 18.2.11 ownership and side-channel contracts, remaining recap
+  quota cost and optional `recap.enabled: false` setting.
+- Corrected the attribution of the provider-registration workaround: upstream
+  pi-claude-bridge #91 concerns prompt capture, not OMP's provider registry.
+
 ## [0.9.4] - 2026-09-23
 
 ### Fixed
@@ -90,7 +121,7 @@ Verified against omp 18.2.8 and Claude Code 2.1.278 on Windows.
   finished subagent took `claude-bridge` out of the shared registry and the parent's next turn
   failed with "No API key for provider: claude-bridge". Registration is now idempotent and
   re-runs on `session_start` and `session_shutdown`, always installing the owning instance's
-  `streamSimple`. (Upstream #91.)
+  `streamSimple`.
 - **Compaction is no longer taken over.** The takeover ran inside an extension handler the host
   aborts at 30 seconds; a real context does not summarize in that time, and a discarded takeover
   left the session uncompacted. The bridge now declines and omp asks for the summary through the

@@ -1,6 +1,6 @@
 import { StringEnum, Type, getModels, type AssistantMessage, type AssistantMessageEventStream, type Context, type Model, type SimpleStreamOptions, type Tool, type Usage } from "@oh-my-pi/pi-coding-agent/extensibility/legacy-pi-ai-shim";
 import * as piAi from "@oh-my-pi/pi-coding-agent/extensibility/legacy-pi-ai-shim";
-import { type ExtensionAPI, type ExtensionUIContext } from "@oh-my-pi/pi-coding-agent";
+import { type ExtensionAPI, type ExtensionContext, type ExtensionUIContext } from "@oh-my-pi/pi-coding-agent";
 import { keyHint } from "@oh-my-pi/pi-tui/chrome";
 import { buildSessionContext } from "@oh-my-pi/pi-coding-agent/session/session-context";
 import type { CompactionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
@@ -180,8 +180,8 @@ function diagDump(label: string, data: Record<string, unknown>) {
 // module instances), we ensure only the FIRST instance to register takes effect.
 // Subsequent instances wrap the stored function instead of overwriting it.
 //
-// On session_shutdown (including /reload), clearSession() resets this so a fresh
-// registration can occur for the next session.
+// Only the owning session's shutdown releases this.
+// Child lifecycle events must not release the parent's routing function.
 const ACTIVE_STREAM_SIMPLE_KEY = Symbol.for("claude-bridge:activeStreamSimple");
 
 const SDK_TO_PI_TOOL_NAME: Record<string, string> = {
@@ -259,6 +259,8 @@ interface SessionState {
 }
 
 let sharedSession: SessionState | null = null;
+let sessionGeneration = 0;
+let mainSessionManager: ExtensionContext["sessionManager"] | undefined;
 
 // Convert pi messages to Anthropic API format for session import.
 // Lossy: non-Anthropic thinking blocks are dropped (no valid signature), and only
@@ -624,7 +626,7 @@ function syncSharedSession(
 	cwd: string,
 	customToolNameToSdk?: Map<string, string>,
 	modelId?: string,
-	isReentrant = false,
+	isIsolated = false,
 	forceRebuild = false,
 ): SyncResult {
 	// Input interleaved with tool results: the results go into history and the
@@ -636,7 +638,7 @@ function syncSharedSession(
 	// starts another query. Resume the child's explicit history in its own fresh
 	// snapshot, even before the main session exists. Never touch shared state or
 	// prewarm here; the caller owns cleanup of this snapshot.
-	if (isReentrant) {
+	if (isIsolated) {
 		if (priorMessages.length > 0) {
 			const session = createSession({
 				projectPath: cwd,
@@ -651,12 +653,12 @@ function syncSharedSession(
 				deleteSession(session.sessionId, cwd, process.env.CLAUDE_CONFIG_DIR);
 				throw error;
 			}
-			debug(`Case 2 synthetic: reentrant history → ephemeral session ${session.sessionId.slice(0, 8)}, ${session.messages.length} records`);
-			debug(`syncResult: path=ephemeral-resume preserve-shared reentrant sessionId=${session.sessionId} priors=${priorMessages.length}`);
+			debug(`Case 2 synthetic: isolated history → ephemeral session ${session.sessionId.slice(0, 8)}, ${session.messages.length} records`);
+			debug(`syncResult: path=ephemeral-resume preserve-shared isolated sessionId=${session.sessionId} priors=${priorMessages.length}`);
 			return { sessionId: session.sessionId, preserveSharedSession: true };
 		}
-		debug(`Case 1 synthetic: reentrant context, clean start${sharedSession ? `, preserving shared session ${sharedSession.sessionId.slice(0, 8)} (cursor=${sharedSession.cursor})` : ", no shared session yet"}`);
-		debug(`syncResult: path=clean-start preserve-shared reentrant priors=${priorMessages.length}`);
+		debug(`Case 1 synthetic: isolated context, clean start${sharedSession ? `, preserving shared session ${sharedSession.sessionId.slice(0, 8)} (cursor=${sharedSession.cursor})` : ", no shared session yet"}`);
+		debug(`syncResult: path=clean-start preserve-shared isolated priors=${priorMessages.length}`);
 		return { sessionId: null, preserveSharedSession: true };
 	}
 
@@ -756,7 +758,10 @@ export const __test = {
 	syncSharedSession,
 	streamClaudeAgentSdk,
 	getMainQueryContext: ctx,
-	clearSession,
+	clearSession() {
+		clearSession();
+		releaseSessionOwner();
+	},
 	promptAndWait,
 	setStreamFactory(factory: () => AssistantMessageEventStream) {
 		const previous = newAssistantMessageEventStream;
@@ -1518,12 +1523,18 @@ function drainForAbort(c: QueryContext, promptStream: PromptStream): void {
 function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream {
 	const stream = newAssistantMessageEventStream();
 
+	// omp runEphemeralTurn assigns a separate routing lineage to recap, /btw
+	// and other side turns, while deliberately sharing the prompt-cache key.
+	// Use that host metadata, not prompt text, model or history length. Classify
+	// BEFORE matching tool IDs: a side snapshot can contain the parent's results.
+	const isSideRequest = /^[^:]+:side:.+$/.test(options?.sessionId ?? "");
+
 	// DEBUG: trace followUp message triggering
 	const lastMsgRole = context.messages[context.messages.length - 1]?.role;
 	debug(`provider: streamClaudeAgentSdk called, activeQuery=${!!ctx().activeQuery}, lastMsgRole=${lastMsgRole}, isReentrant=${ctx().activeQuery !== null}`);
 
 	const activeQuery = ctx().activeQuery !== null;
-	const allResults = extractAllToolResults(context);
+	const allResults = isSideRequest ? [] : extractAllToolResults(context);
 	const resultCtx = allResults.length > 0 ? contextForToolResults(allResults) : undefined;
 	const isReentrantUserQuery = activeQuery && lastMsgRole === "user" && allResults.length === 0;
 	if (isReentrantUserQuery) {
@@ -1603,11 +1614,12 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 
 	// --- Fresh query ---
 
-	// 1. Determine reentrancy. Reentrant queries get their own QueryContext so
-	//    background subagents can run concurrently with the parent query.
+	// Side turns need a private context even while idle: a real main turn can
+	// start before the side request completes and must retain the main context.
 	const isReentrant = activeQuery;
-	const queryCtx = isReentrant ? new QueryContext() : ctx();
-	debug(`provider: fresh query setup, isReentrant=${isReentrant}, activeContexts=${activeQueryContexts.size}`);
+	const isIsolated = isReentrant || isSideRequest;
+	const queryCtx = isIsolated ? new QueryContext() : ctx();
+	debug(`provider: fresh query setup, isReentrant=${isReentrant}, sideChannel=${isSideRequest}, activeContexts=${activeQueryContexts.size}`);
 
 	// 2. Fresh child context — constructor already gave us clean Maps and empty
 	//    arrays. For a reused top-level context, clear explicitly.
@@ -1745,7 +1757,9 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 
 	let resumeSessionId: string | null = null;
 	let capturedSessionId: string | undefined;
-	let ownsSharedSession = !isReentrant;
+	let ownsSharedSession = !isIsolated;
+	const generation = sessionGeneration;
+	const canUpdateSharedSession = () => ownsSharedSession && generation === sessionGeneration;
 	const cleanupEphemeralSessions = () => {
 		if (ownsSharedSession) return;
 		if (resumeSessionId && resumeSessionId !== parentSessionId && resumeSessionId !== sharedSession?.sessionId) {
@@ -1763,9 +1777,9 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	let wasAborted = false;
 	let sdkQuery: Query;
 	try {
-		const syncResult = syncSharedSession(pendingInput.history as Context["messages"], cwd, customToolNameToSdk, model.id, isReentrant, pendingInput.interleaved);
+		const syncResult = syncSharedSession(pendingInput.history as Context["messages"], cwd, customToolNameToSdk, model.id, isIsolated, pendingInput.interleaved);
 		resumeSessionId = syncResult.sessionId;
-		ownsSharedSession = !isReentrant && !syncResult.preserveSharedSession;
+		ownsSharedSession = !isIsolated && !syncResult.preserveSharedSession;
 		queryCtx.ownsSharedSession = ownsSharedSession;
 		if (resumeSessionId) queryOptions.resume = resumeSessionId;
 		// Rebuild child history from omp each time. Disable CLI writes so
@@ -1799,7 +1813,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	};
 	const onAbort = () => {
 		wasAborted = true;
-		if (ownsSharedSession) discardWarm("abort");
+		if (canUpdateSharedSession()) discardWarm("abort");
 		drainForAbort(abortCtx, promptStream);
 		abortCtx.pendingToolCalls.clear();
 		abortCtx.pendingResults.clear();
@@ -1824,8 +1838,8 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 
 			// --- Abort detection in normal completion path ---
 			if (wasAborted || options?.signal?.aborted) {
-				if (ownsSharedSession && sharedSession) sharedSession = { ...sharedSession, needsRebuild: true, forceRotate: true };
-				debug(`provider: abort detected${ownsSharedSession ? ", marked sharedSession needsRebuild + forceRotate" : ", preserving sharedSession"}`);
+				if (canUpdateSharedSession() && sharedSession) sharedSession = { ...sharedSession, needsRebuild: true, forceRotate: true };
+				debug(`provider: abort detected${canUpdateSharedSession() ? ", marked sharedSession needsRebuild + forceRotate" : ", preserving sharedSession"}`);
 				if (queryCtx.turnOutput) {
 					queryCtx.turnOutput.stopReason = "aborted";
 					queryCtx.turnOutput.errorMessage = "Operation aborted";
@@ -1840,11 +1854,10 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 
 			// --- Capture session ID ---
 			const sessionId = capturedSessionId ?? sharedSession?.sessionId;
-			// A reentrant (subagent) query never becomes the shared session either:
-			// a child that finishes after its parent would otherwise hand the next
-			// main turn a --resume onto the child's own history.
-			if (!ownsSharedSession) {
-				debug(`provider: query done, ignoring captured session ${capturedSessionId?.slice(0, 8) ?? "none"} to preserve shared session${isReentrant ? " (reentrant)" : ""}`);
+			// Children/side turns never publish shared state. Nor may an old main
+			// query resurrect a session cleared by a real transition or shutdown.
+			if (!canUpdateSharedSession()) {
+				debug(`provider: query done, ignoring captured session ${capturedSessionId?.slice(0, 8) ?? "none"} to preserve shared session${isSideRequest ? " (side-channel)" : isReentrant ? " (reentrant)" : ""}`);
 			} else if (sessionId) {
 				const cursor = Math.max(context.messages.length, queryCtx.latestCursor, sharedSession?.cursor ?? 0);
 				// Spread first: a compaction / tree event that fired while this
@@ -1859,7 +1872,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			}
 
 
-			if (!isReentrant && queryCtx.activeQuery === sdkQuery) {
+			if (!isIsolated && queryCtx.activeQuery === sdkQuery) {
 				debug("provider: clearing activeQuery before final stream completion");
 				queryCtx.activeQuery = null;
 			}
@@ -1869,7 +1882,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			// turn just extended. Only for a clean main-thread stop with a session
 			// to resume and no pending rebuild (a rebuild rewrites the JSONL the
 			// warm process would be reading).
-			if (ownsSharedSession && sharedSession && !sharedSession.needsRebuild && queryCtx.turnOutput?.stopReason === "stop") {
+			if (canUpdateSharedSession() && sharedSession && !sharedSession.needsRebuild && queryCtx.turnOutput?.stopReason === "stop") {
 				const nextOptions = {
 					...queryOptions,
 					resume: sharedSession.sessionId,
@@ -1880,7 +1893,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		})
 		.catch((error) => {
 			debug(`provider: query error, model=${cliModel}, aborted=${Boolean(options?.signal?.aborted)}, error=`, error);
-			if (ownsSharedSession) {
+			if (canUpdateSharedSession()) {
 				discardWarm("query error");
 				if ((wasAborted || options?.signal?.aborted) && sharedSession) {
 					sharedSession = { ...sharedSession, needsRebuild: true, forceRotate: true };
@@ -1893,7 +1906,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 				queryCtx.turnOutput.errorMessage = error instanceof Error ? error.message : String(error);
 				if (error instanceof ClaudeUsageLimitError) queryCtx.turnOutput.errorStatus = error.status;
 			}
-			if (!isReentrant && queryCtx.activeQuery === sdkQuery) {
+			if (!isIsolated && queryCtx.activeQuery === sdkQuery) {
 				for (const pending of queryCtx.pendingToolCalls.values()) { pending.resolve({ content: [{ type: "text", text: "Query ended" }] }); }
 				queryCtx.pendingToolCalls.clear();
 				queryCtx.pendingResults.clear();
@@ -2100,17 +2113,22 @@ async function promptAndWait(
 	}
 }
 
-// Reset shared session on pi session lifecycle events.
+// OMP emits shutdown before aborting the agent. Invalidate shared-state writes
+// from its still-unwinding queries, without interrupting their resource cleanup.
 function clearSession(event = "test reset"): void {
 	debug(`${event}: clearing session ${sharedSession?.sessionId?.slice(0, 8) ?? "none"}`);
+	sessionGeneration++;
 	sharedSession = null;
+	for (const queryCtx of activeQueryContexts) queryCtx.ownsSharedSession = false;
 	discardWarm(event);
+}
 
-	// Clear the global streamSimple if this instance registered it.
-	// This allows /reload to register fresh without wrapping stale state.
+function releaseSessionOwner(): void {
+	mainSessionManager = undefined;
+	piUI = null;
 	const g = globalThis as Record<symbol, any>;
 	if (g[ACTIVE_STREAM_SIMPLE_KEY] === streamClaudeAgentSdk) {
-		debug(`${event}: clearing ACTIVE_STREAM_SIMPLE_KEY`);
+		debug("session_shutdown: clearing ACTIVE_STREAM_SIMPLE_KEY");
 		g[ACTIVE_STREAM_SIMPLE_KEY] = undefined;
 	}
 }
@@ -2167,7 +2185,8 @@ export default function (pi: ExtensionAPI) {
 	// every runtime provider registered by an extension source when one of that
 	// source's instances is torn down — a finished subagent takes claude-bridge
 	// out of the shared registry, and the parent's next turn fails with
-	// "No API key for provider: claude-bridge" (upstream pi-claude-bridge #91).
+	// "No API key for provider: claude-bridge". This is omp's source-scoped
+	// registry teardown, not upstream pi-claude-bridge's prompt-capture issue #91.
 	const registerBridgeProvider = (reason: string) => {
 		const streamSimple = g[ACTIVE_STREAM_SIMPLE_KEY] ?? streamClaudeAgentSdk;
 		g[ACTIVE_STREAM_SIMPLE_KEY] = streamSimple;
@@ -2224,24 +2243,41 @@ export default function (pi: ExtensionAPI) {
 	};
 	registerBridgeProvider("activate");
 
+	// Each runner supplies its own manager object. OMP keeps that object through
+	// /new, switch and branch, even when its ID/file/parentSession changes.
+	// The first start on the provider-owning module pins the main runner; child
+	// starts cannot replace it, including when the main query is already idle.
+	const ownsSession = (context: ExtensionContext, claim = false): boolean => {
+		if (g[ACTIVE_STREAM_SIMPLE_KEY] !== streamClaudeAgentSdk) return false;
+		if (claim && !mainSessionManager) mainSessionManager = context.sessionManager;
+		return !!mainSessionManager && mainSessionManager === context.sessionManager;
+	};
 	pi.on("session_start", (_event, ctx) => {
-		piUI = ctx.ui;
-		clearSession("session_start");
+		if (ownsSession(ctx, true)) {
+			piUI = ctx.ui;
+			clearSession("session_start");
+		} else debug("session_start: ignoring non-owning session");
 		registerBridgeProvider("session_start");
 	});
-	// A subagent finishing tears down its extension instance, and the host drops
-	// the whole source's runtime providers with it. Put ours back.
-	pi.on("session_switch", (event) => clearSession(`session_switch:${event.reason}`));
-	pi.on("session_branch", () => clearSession("session_branch"));
-	pi.on("session_shutdown", () => {
-		clearSession("session_shutdown");
-		// A finishing subagent takes this extension source's runtime providers
-		// down with it, including ours. Put it back for the parent session.
-		registerBridgeProvider("session_shutdown");
+	pi.on("session_switch", (event, ctx) => {
+		if (ownsSession(ctx)) clearSession(`session_switch:${event.reason}`);
+	});
+	pi.on("session_branch", (_event, ctx) => {
+		if (ownsSession(ctx)) clearSession("session_branch");
+	});
+	pi.on("session_shutdown", (_event, ctx) => {
+		if (ownsSession(ctx)) {
+			clearSession("session_shutdown");
+			releaseSessionOwner();
+		} else if (g[ACTIVE_STREAM_SIMPLE_KEY]) {
+			// A child teardown can remove this source's runtime provider. Restore
+			// the living owner's callback, never resurrect one after its shutdown.
+			registerBridgeProvider("session_shutdown");
+		}
 	});
 
 	pi.on("session_before_compact", async (event, ctx) => {
-		if (ctx.model?.baseUrl !== "claude-bridge") return undefined;
+		if (!ownsSession(ctx) || ctx.model?.baseUrl !== "claude-bridge") return undefined;
 		// Default off: the takeover runs inside an extension handler, which the host
 		// aborts at 30 s — not enough to summarize a real context, and a discarded
 		// takeover leaves the session uncompacted (the host does not fall back to its
@@ -2316,8 +2352,16 @@ export default function (pi: ExtensionAPI) {
 			sharedSession = { ...sharedSession, needsRebuild: true };
 		}
 	};
-	pi.on("session_compact", (event) => { discardWarm("session_compact"); markRebuild(`session_compact:fromExtension=${event.fromExtension}`); });
-	pi.on("session_tree", () => { discardWarm("session_tree"); markRebuild("session_tree"); });
+	pi.on("session_compact", (event, ctx) => {
+		if (!ownsSession(ctx)) return;
+		discardWarm("session_compact");
+		markRebuild(`session_compact:fromExtension=${event.fromExtension}`);
+	});
+	pi.on("session_tree", (_event, ctx) => {
+		if (!ownsSession(ctx)) return;
+		discardWarm("session_tree");
+		markRebuild("session_tree");
+	});
 
 
 	// --- AskClaude tool ---

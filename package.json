@@ -1,6 +1,6 @@
 {
 	"name": "omp-claude-bridge",
-	"version": "0.9.4",
+	"version": "0.9.5",
 	"private": false,
 	"description": "Run Claude Code inside Oh My Pi: omp's own prompt and tools, mid-turn steering, subscription quota, model list from Claude Code's picker.",
 	"keywords": [

@@ -16,12 +16,19 @@ bun test tests/*.test.ts
 | `usage.test.ts` | Quota from SDK rate-limit events: `unifiedWindows` fractions, the documented percentage fallback, stale windows, values on an unknown scale |
 | `claude-models.test.ts` | Collapsing Claude Code's picker entries into base model ids and 1M capability |
 | `developer-input.test.ts` | Developer markers, multiple pending inputs, interleaved results, lossless images and rebuilt tool pairing |
-| `developer-routing.test.ts` | Real provider routing with simulated SDK `query`/`startup`: developer input during MCP execution, write-ack ordering, duplicate callbacks, orphans, aborts, prewarm reuse and AskClaude history; child-history replay and parent isolation; private-file cleanup on completion without init, iterator/startup errors and aborts |
+| `developer-routing.test.ts` | Real provider routing with simulated SDK `query`/`startup`: developer input during MCP execution, write-ack ordering, duplicate callbacks, orphans, aborts, prewarm reuse and AskClaude history; child/side-history replay and parent isolation; private-file cleanup on completion without init, iterator/startup errors and aborts; lifecycle ownership and late shutdown finalizers |
 
 The routing fixture runs the production provider and MCP routing closures, not helper-only
 approximations. It replaces SDK transport and the host event sink, so it exercises no live
 Claude Code process. Session files and diagnostics stay in temporary directories inside
 the repository, removed after each test file.
+
+The side-request regressions pass omp's `<session>:side:…` metadata through the actual provider.
+They cover a shortened idle recap, a main turn overlapping the recap, copied parent tool results,
+abort/error cleanup, and ordinary user text containing recap markers. Lifecycle tests activate
+the extension with distinct manager objects and exercise child events, main switch/branch,
+compact/tree and shutdown. Assertions observe transcript bytes, session/cursor state, actual
+MCP result delivery and prewarm reuse; no live Claude request or quota measurement is involved.
 
 ## Integration (`node`, drives omp over its RPC protocol — spends quota)
 

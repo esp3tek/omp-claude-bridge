@@ -15,7 +15,7 @@ type PromptMessage = { type: string; message: { role: string; content: Content[]
 type ToolResult = { content: Content[]; isError?: boolean; toolCallId?: string };
 type ToolHandler = (toolCallId: string) => Promise<ToolResult>;
 type FakeMcpServer = { instance: { tools: Array<{ handler: ToolHandler }> } };
-type QueryOptions = { mcpServers?: Record<string, FakeMcpServer>; resume?: string };
+type QueryOptions = { mcpServers?: Record<string, FakeMcpServer>; resume?: string; persistSession?: boolean };
 type QueryArgs = { prompt: AsyncIterable<PromptMessage> | string; options: QueryOptions };
 type Run = (args: QueryArgs, query: FakeQuery) => AsyncGenerator<unknown>;
 type FakeWarm = { query(prompt: QueryArgs["prompt"]): FakeQuery; close(): void };
@@ -79,6 +79,7 @@ const root = mkdtempSync(join(process.cwd(), ".developer-routing-"));
 mkdirSync(join(root, ".omp", "agent"), { recursive: true });
 const previousClaudeConfigDir = process.env.CLAUDE_CONFIG_DIR;
 const previousDebug = process.env.CLAUDE_BRIDGE_DEBUG;
+const previousNonessentialTraffic = process.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC;
 process.env.CLAUDE_CONFIG_DIR = root;
 process.env.CLAUDE_BRIDGE_DEBUG = "0";
 // The pre-fix empty-developer regression emits an unconditional diagnostic.
@@ -87,7 +88,7 @@ mock.module("os", () => ({ ...osModule, homedir: () => root }));
 // Static import cannot work: the module under test must observe the SDK mocks.
 // This query string gives the routing fixture its own index evaluation: other
 // test files load the normal extension before this test installs host mocks.
-const { __test: T } = await import("../src/index.ts?developer-routing");
+const { default: activateExtension, __test: T } = await import("../src/index.ts?developer-routing");
 // The host stubs omit the stream class; this test supplies only its event sink.
 const previousStreamFactory = T.setStreamFactory(() => new FakeAssistantStream() as unknown as AssistantMessageEventStream);
 
@@ -278,6 +279,8 @@ afterAll(() => {
 	else process.env.CLAUDE_CONFIG_DIR = previousClaudeConfigDir;
 	if (previousDebug === undefined) delete process.env.CLAUDE_BRIDGE_DEBUG;
 	else process.env.CLAUDE_BRIDGE_DEBUG = previousDebug;
+	if (previousNonessentialTraffic === undefined) delete process.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC;
+	else process.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = previousNonessentialTraffic;
 	rmSync(root, { recursive: true, force: true });
 	mock.restore();
 	T.setStreamFactory(previousStreamFactory);
@@ -906,5 +909,406 @@ test("a history-bearing child leaves its active parent's warmed SDK process inta
 	} finally {
 		queries[1]?.close();
 		await parent.ended.promise;
+	}
+});
+
+const recapMarker = "Ephemeral side-channel turn; reuses current conversation context.";
+const recapReminder = d(`<system-reminder>${recapMarker}</system-reminder>`);
+const recapPrompt = u("<recap>Summarize the current conversation for the user.</recap>");
+const earlierAnswer = { role: "assistant", content: [{ type: "text", text: "abridged answer" }], stopReason: "stop", timestamp: 1 };
+
+test("idle recap imports private history without rewriting the main session or cursor", async () => {
+	const parent = parentSession();
+	parent.shared.cursor = 3;
+	T.setSharedSession({ ...parent.shared });
+	const sideOptions = { cwd: root, sessionId: `${parent.shared.sessionId}:side:1234`, promptCacheKey: parent.shared.sessionId };
+	let imported: ImportedSession | null = null;
+	const prompts: PromptMessage[] = [];
+	runs.push(async function* ({ prompt, options }) {
+		imported = importedSession(options.resume);
+		if (typeof prompt !== "string") prompts.push((await prompt[Symbol.asyncIterator]().next()).value);
+		yield { type: "result", subtype: "success", result: "recap complete" };
+	});
+	const side = terminalEvent(T.streamClaudeAgentSdk(model, context([
+		u("abridged history, not the parent's transcript"), earlierAnswer, recapReminder, recapPrompt,
+	]), sideOptions));
+	await side.ended.promise;
+	await queries[0]!.closed.promise;
+	expect(side.events.at(-1)).toMatchObject({ type: "done", reason: "stop" });
+	expect(queryCalls[0]?.options.resume).not.toBe(parent.shared.sessionId);
+	expect(queryCalls[0]?.options.persistSession).toBe(false);
+	expect(JSON.stringify(requireImported(imported).content)).toContain("abridged history, not the parent's transcript");
+	expect(JSON.stringify(requireImported(imported).content)).not.toContain("parent history marker");
+	expect(prompts.map(promptText)).toEqual([`${DEVELOPER_OPEN}<system-reminder>${recapMarker}</system-reminder>${DEVELOPER_CLOSE}\n<recap>Summarize the current conversation for the user.</recap>`]);
+	expectRemoved(queryCalls[0]?.options.resume);
+	expectParentUnchanged(parent);
+});
+
+test("a main turn starting while an idle recap is pending keeps its session and prewarm", async () => {
+	const parent = parentSession();
+	let warmUses = 0;
+	let warmCloses = 0;
+	const warmPrompts: PromptMessage[] = [];
+	startWarm = async (options) => ({
+		query(prompt) {
+			warmUses++;
+			const query = new FakeQuery({ prompt, options }, successRun(warmPrompts, parent.shared.sessionId));
+			queries.push(query);
+			return query;
+		},
+		close() { warmCloses++; },
+	});
+	runs.push(successRun([], parent.shared.sessionId));
+	const first = terminalEvent(T.streamClaudeAgentSdk(model, context([
+		u("parent history marker"), { role: "assistant", content: [{ type: "text", text: "parent answered earlier" }], stopReason: "stop", timestamp: 1 },
+		u("first main turn"),
+	]), { cwd: root }));
+	await first.ended.promise;
+	await queries[0]!.closed.promise;
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	Object.assign(parent.shared, T.getSharedSession()!);
+	parent.bytes = readFileSync(parent.path, "utf8");
+
+	const sideStarted = new Deferred<undefined>();
+	runs.push(async function* ({ options }, query) {
+		importedSession(options.resume);
+		sideStarted.resolve(undefined);
+		await query.closed.promise;
+	});
+	const side = terminalEvent(T.streamClaudeAgentSdk(model, context([
+		u("abridged side history"), earlierAnswer, recapReminder, recapPrompt,
+	]), { cwd: root, sessionId: `${parent.shared.sessionId}:side:1234`, promptCacheKey: parent.shared.sessionId }));
+	try {
+		await sideStarted.promise;
+		expectParentUnchanged(parent);
+		const main = terminalEvent(T.streamClaudeAgentSdk(model, context([
+			u("parent history marker"), { role: "assistant", content: [{ type: "text", text: "parent answered earlier" }], stopReason: "stop", timestamp: 1 },
+			u("first main turn"), { role: "assistant", content: [{ type: "text", text: "finished" }], stopReason: "stop", timestamp: 1 },
+			u("second main turn"),
+		]), { cwd: root }));
+		await main.ended.promise;
+		expect(main.events.at(-1)).toMatchObject({ type: "done", reason: "stop" });
+		expect(warmUses).toBe(1);
+		expect(warmCloses).toBe(0);
+		expect(warmPrompts.map(promptText)).toEqual(["second main turn"]);
+		expect(queryCalls[1]?.options.resume).not.toBe(parent.shared.sessionId);
+		expect(readFileSync(parent.path, "utf8")).toBe(parent.bytes);
+	} finally {
+		queries[1]?.close();
+		await side.ended.promise;
+	}
+	expectRemoved(queryCalls[1]?.options.resume);
+});
+
+for (const failure of ["iterator error", "abort"] as const) {
+	test(`idle recap ${failure} cleans its private session without invalidating its parent's prewarm`, async () => {
+		const parent = parentSession();
+		let warmUses = 0;
+		let warmCloses = 0;
+		startWarm = async (options) => ({
+			query(prompt) {
+				warmUses++;
+				const query = new FakeQuery({ prompt, options }, successRun([], parent.shared.sessionId));
+				queries.push(query);
+				return query;
+			},
+			close() { warmCloses++; },
+		});
+		runs.push(successRun([], parent.shared.sessionId));
+		const first = terminalEvent(T.streamClaudeAgentSdk(model, context([
+			u("parent history marker"), { role: "assistant", content: [{ type: "text", text: "parent answered earlier" }], stopReason: "stop", timestamp: 1 },
+			u("main first turn"),
+		]), { cwd: root }));
+		await first.ended.promise;
+		await queries[0]!.closed.promise;
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		Object.assign(parent.shared, T.getSharedSession()!);
+		parent.bytes = readFileSync(parent.path, "utf8");
+		const started = new Deferred<undefined>();
+		let imported: ImportedSession | null = null;
+		runs.push(async function* ({ options }, query) {
+			imported = importedSession(options.resume);
+			started.resolve(undefined);
+			if (failure === "abort") await query.closed.promise;
+			else throw new Error("recap query failed");
+		});
+		const controller = new AbortController();
+		const side = terminalEvent(T.streamClaudeAgentSdk(model, context([
+			u("shortened side history"), earlierAnswer, recapReminder, recapPrompt,
+		]), { cwd: root, sessionId: `${parent.shared.sessionId}:side:1234`, promptCacheKey: parent.shared.sessionId, signal: controller.signal }));
+		await started.promise;
+		expect(queryCalls[1]?.options.persistSession).toBe(false);
+		expect(queryCalls[1]?.options.resume).not.toBe(parent.shared.sessionId);
+		expect(JSON.stringify(requireImported(imported).content)).toContain("shortened side history");
+		expectParentUnchanged(parent);
+		if (failure === "abort") controller.abort();
+		await side.ended.promise;
+		await queries[1]!.closed.promise;
+		expect(side.events.at(-1)).toMatchObject({ type: "error", error: { stopReason: failure === "abort" ? "aborted" : "error" } });
+		expectRemoved(queryCalls[1]?.options.resume);
+		expectParentUnchanged(parent);
+		expect(warmCloses).toBe(0);
+		const next = terminalEvent(T.streamClaudeAgentSdk(model, context([
+			u("parent history marker"), { role: "assistant", content: [{ type: "text", text: "parent answered earlier" }], stopReason: "stop", timestamp: 1 },
+			u("main first turn"), { role: "assistant", content: [{ type: "text", text: "finished" }], stopReason: "stop", timestamp: 1 },
+			u("main turn after failed recap"),
+		]), { cwd: root }));
+		await next.ended.promise;
+		expect(next.events.at(-1)).toMatchObject({ type: "done", reason: "stop" });
+		expect(warmUses).toBe(1);
+		expect(warmCloses).toBe(0);
+		expect(queryCalls).toHaveLength(2);
+	});
+}
+
+test("recap-looking text in a normal turn still rebuilds drifted main history", async () => {
+	const parent = parentSession();
+	parent.shared.cursor = 3;
+	T.setSharedSession({ ...parent.shared });
+	runs.push(successRun([], parent.shared.sessionId));
+	const stream = terminalEvent(T.streamClaudeAgentSdk(model, context([
+		u("revised main history"), earlierAnswer, recapReminder, u("normal user turn quoting <recap>"),
+	]), { cwd: root }));
+	await stream.ended.promise;
+	expect(stream.events.at(-1)).toMatchObject({ type: "done", reason: "stop" });
+	expect(queryCalls[0]?.options.resume).toBe(parent.shared.sessionId);
+	expect(queryCalls[0]?.options.persistSession).not.toBe(false);
+	const rewritten = readFileSync(parent.path, "utf8");
+	expect(rewritten).toContain("revised main history");
+	expect(rewritten).not.toContain("parent history marker");
+	expect(rewritten).not.toBe(parent.bytes);
+});
+
+test("side recap carrying an active parent's tool result never delivers it to that parent", async () => {
+	const parent = parentSession();
+	const state = {
+		prompts: [] as PromptMessage[], results: [] as ToolResult[],
+		ready: new Deferred<undefined>(), delivered: new Deferred<undefined>(), finish: new Deferred<undefined>(),
+	};
+	runs.push(toolRun(["tool-1"], state));
+	const parentHistory = [
+		u("parent history marker"), { role: "assistant", content: [{ type: "text", text: "parent answered earlier" }], stopReason: "stop", timestamp: 1 },
+		u("parent active"),
+	];
+	T.streamClaudeAgentSdk(model, context(parentHistory, [tool]), { cwd: root });
+	await state.ready.promise;
+	const prompts: PromptMessage[] = [];
+	runs.push(successRun(prompts));
+	const side = terminalEvent(T.streamClaudeAgentSdk(model, context([
+		u("abridged tool history"), a("tool-1"), result("tool-1", "side-only copied result"),
+		recapReminder, recapPrompt,
+	], [tool]), { cwd: root, sessionId: `${parent.shared.sessionId}:side:1234`, promptCacheKey: parent.shared.sessionId }));
+	try {
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		expect(queryCalls).toHaveLength(2);
+		expect(state.results).toEqual([]);
+		await side.ended.promise;
+		expect(prompts.map(promptText)[0]).toContain("<recap>");
+		expect(queryCalls[1]?.options.persistSession).toBe(false);
+		expectParentUnchanged(parent);
+		const callback = terminalEvent(T.streamClaudeAgentSdk(model, context([
+			...parentHistory, a("tool-1"), d("actual parent steer"), result("tool-1", "actual parent result"),
+		], [tool]), { cwd: root }));
+		await state.delivered.promise;
+		expect(state.results.map((entry) => entry.content[0]?.text)).toEqual(["actual parent result"]);
+		expect(promptText(state.prompts[1]!)).toContain(`${DEVELOPER_OPEN}actual parent steer${DEVELOPER_CLOSE}`);
+		state.finish.resolve(undefined);
+		await callback.ended.promise;
+	} finally {
+		state.finish.resolve(undefined);
+		queries[0]?.close();
+	}
+	expectRemoved(queryCalls[1]?.options.resume);
+});
+
+type SessionManagerStub = { id: string; file: string; getSessionId(): string; getSessionFile(): string };
+function manager(id: string): SessionManagerStub {
+	return {
+		id, file: join(root, `${id}.jsonl`),
+		getSessionId() { return this.id; },
+		getSessionFile() { return this.file; },
+	};
+}
+function extension(manager: SessionManagerStub, activate = activateExtension) {
+	const handlers = new Map<string, (event: unknown, ctx: unknown) => unknown>();
+	const providers: Array<{ streamSimple: typeof T.streamClaudeAgentSdk }> = [];
+	activate({
+		on(name: string, handler: (event: unknown, ctx: unknown) => unknown) { handlers.set(name, handler); },
+		registerProvider(_id: string, provider: { streamSimple: typeof T.streamClaudeAgentSdk }) { providers.push(provider); },
+		registerTool() {},
+	} as unknown as Parameters<typeof activateExtension>[0]);
+	return {
+		providers,
+		fire(name: string, event: Record<string, unknown> = {}) {
+			const handler = handlers.get(name);
+			if (!handler) throw new Error(`missing lifecycle handler: ${name}`);
+			return handler(event, { sessionManager: manager, ui: { notify() {} } });
+		},
+	};
+}
+
+test("a different manager's lifecycle leaves the owner's transcript and prewarm available", async () => {
+	const mainManager = manager("main-session");
+	const main = extension(mainManager);
+	main.fire("session_start");
+	const parent = parentSession();
+	let warmUses = 0;
+	let warmCloses = 0;
+	startWarm = async (options) => ({
+		query(prompt) {
+			warmUses++;
+			const query = new FakeQuery({ prompt, options }, successRun([], parent.shared.sessionId));
+			queries.push(query);
+			return query;
+		},
+		close() { warmCloses++; },
+	});
+	runs.push(successRun([], parent.shared.sessionId));
+	const first = terminalEvent(T.streamClaudeAgentSdk(model, context([
+		u("parent history marker"), { role: "assistant", content: [{ type: "text", text: "parent answered earlier" }], stopReason: "stop", timestamp: 1 },
+		u("main first turn"),
+	]), { cwd: root }));
+	await first.ended.promise;
+	await queries[0]!.closed.promise;
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	Object.assign(parent.shared, T.getSharedSession()!);
+	parent.bytes = readFileSync(parent.path, "utf8");
+
+	const child = extension(manager("different-child-session"));
+	child.fire("session_start");
+	child.fire("session_switch", { reason: "new" });
+	child.fire("session_branch");
+	child.fire("session_compact", { fromExtension: false });
+	child.fire("session_tree");
+	expectParentUnchanged(parent);
+	expect(warmCloses).toBe(0);
+	child.fire("session_shutdown");
+	expect(child.providers.at(-1)?.streamSimple).toBe(main.providers.at(-1)?.streamSimple);
+	expectParentUnchanged(parent);
+	const next = terminalEvent(T.streamClaudeAgentSdk(model, context([
+		u("parent history marker"), { role: "assistant", content: [{ type: "text", text: "parent answered earlier" }], stopReason: "stop", timestamp: 1 },
+		u("main first turn"), { role: "assistant", content: [{ type: "text", text: "finished" }], stopReason: "stop", timestamp: 1 },
+		u("main next turn"),
+	]), { cwd: root }));
+	await next.ended.promise;
+	expect(warmUses).toBe(1);
+	expect(warmCloses).toBe(0);
+	expect(queryCalls).toHaveLength(1);
+	expect(next.events.at(-1)).toMatchObject({ type: "done", reason: "stop" });
+});
+
+test("the owning manager's compact and tree events invalidate its warm resume and rebuild history", async () => {
+	const owner = extension(manager("compact-owner"));
+	owner.fire("session_start");
+	const parent = parentSession();
+	let warmCloses = 0;
+	startWarm = async () => ({ query() { throw new Error("invalidated prewarm was reused"); }, close() { warmCloses++; } });
+	runs.push(successRun([], parent.shared.sessionId));
+	const initial = terminalEvent(T.streamClaudeAgentSdk(model, context([
+		u("parent history marker"), { role: "assistant", content: [{ type: "text", text: "parent answered earlier" }], stopReason: "stop", timestamp: 1 },
+		u("first turn"),
+	]), { cwd: root }));
+	await initial.ended.promise;
+	await queries[0]!.closed.promise;
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	owner.fire("session_compact", { fromExtension: false });
+	expect(T.getSharedSession()).toMatchObject({ sessionId: parent.shared.sessionId, needsRebuild: true });
+	expect(warmCloses).toBe(1);
+	owner.fire("session_tree");
+	runs.push(successRun([], parent.shared.sessionId));
+	const rebuilt = terminalEvent(T.streamClaudeAgentSdk(model, context([
+		u("revised owner history"), earlierAnswer, u("after compact and tree"),
+	]), { cwd: root }));
+	await rebuilt.ended.promise;
+	expect(queryCalls[1]?.options.resume).toBe(parent.shared.sessionId);
+	expect(readFileSync(parent.path, "utf8")).toContain("revised owner history");
+	expect(readFileSync(parent.path, "utf8")).not.toContain("parent history marker");
+});
+
+test("owner identity persists across session switches but its new session and branch cannot resume stale history", async () => {
+	const ownManager = manager("first-owner-session");
+	const owner = extension(ownManager);
+	owner.fire("session_start");
+	const first = parentSession();
+	ownManager.id = "new-owner-session";
+	ownManager.file = join(root, "new-owner-session.jsonl");
+	owner.fire("session_switch", { reason: "new" });
+	expect(T.getSharedSession()).toBeNull();
+	T.setSharedSession({ ...first.shared });
+	ownManager.id = "switched-owner-session";
+	ownManager.file = join(root, "switched-owner-session.jsonl");
+	owner.fire("session_switch", { reason: "switch" });
+	expect(T.getSharedSession()).toBeNull();
+	T.setSharedSession({ ...first.shared });
+	owner.fire("session_branch");
+	expect(T.getSharedSession()).toBeNull();
+	expect(readFileSync(first.path, "utf8")).toBe(first.bytes);
+	runs.push(successRun([]));
+	const fresh = terminalEvent(T.streamClaudeAgentSdk(model, context([u("new branch input")]), { cwd: root }));
+	await fresh.ended.promise;
+	expect(queryCalls[0]?.options.resume).toBeUndefined();
+});
+
+test("owner shutdown blocks a late query finalizer from restoring its session or spawning prewarm", async () => {
+	const owner = extension(manager("shutdown-owner"));
+	owner.fire("session_start");
+	const parent = parentSession();
+	let warmStarts = 0;
+	startWarm = async () => {
+		warmStarts++;
+		return { query() { throw new Error("unexpected prewarm"); }, close() {} };
+	};
+	const started = new Deferred<undefined>();
+	const finish = new Deferred<undefined>();
+	runs.push(async function* ({ prompt }) {
+		if (typeof prompt !== "string") await prompt[Symbol.asyncIterator]().next();
+		yield { type: "system", subtype: "init", session_id: parent.shared.sessionId };
+		started.resolve(undefined);
+		await finish.promise;
+		yield { type: "result", subtype: "success", result: "late main answer" };
+	});
+	const stream = terminalEvent(T.streamClaudeAgentSdk(model, context([
+		u("parent history marker"), { role: "assistant", content: [{ type: "text", text: "parent answered earlier" }], stopReason: "stop", timestamp: 1 },
+		u("pending main"),
+	]), { cwd: root }));
+	await started.promise;
+	const registrations = owner.providers.length;
+	owner.fire("session_shutdown");
+	expect(T.getSharedSession()).toBeNull();
+	finish.resolve(undefined);
+	await stream.ended.promise;
+	expect(T.getSharedSession()).toBeNull();
+	await queries[0]!.closed.promise;
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	expect(owner.providers).toHaveLength(registrations);
+	expect(warmStarts).toBe(0);
+	expect(readFileSync(parent.path, "utf8")).toBe(parent.bytes);
+	runs.push(successRun([]));
+	const next = terminalEvent(T.streamClaudeAgentSdk(model, context([u("fresh session after shutdown")]), { cwd: root }));
+	await next.ended.promise;
+	expect(queryCalls[1]?.options.resume).toBeUndefined();
+});
+
+test("late child shutdown cannot take ownership from a replacement extension module", async () => {
+	const owner = extension(manager("previous-owner"));
+	owner.fire("session_start");
+	const child = extension(manager("late-child"));
+	child.fire("session_start");
+	owner.fire("session_shutdown");
+	child.fire("session_shutdown");
+
+	// A distinct evaluation models a newly loaded extension, not another runner
+	// calling the same cached module's activation function.
+	const { default: activateNext, __test: nextT } = await import("../src/index.ts?replacement-owner");
+	try {
+		const replacement = extension(manager("replacement-owner"), activateNext);
+		replacement.fire("session_start");
+		const parent = parentSession();
+		nextT.setSharedSession({ ...parent.shared });
+		replacement.fire("session_switch", { reason: "new" });
+		expect(nextT.getSharedSession()).toBeNull();
+		expect(readFileSync(parent.path, "utf8")).toBe(parent.bytes);
+	} finally {
+		nextT.clearSession();
 	}
 });

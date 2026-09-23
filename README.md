@@ -45,7 +45,9 @@ Upstream's omp port has not been updated since July 2026, so the fixes below liv
 - A `tool_use` naming a tool we do not serve (the model reaching for a native `bash`/`Edit`) is no
   longer forwarded to omp, which used to execute it for real while Claude Code rejected it.
 - An exhausted subscription surfaces as a 429 so omp walks its fallback chain (upstream #58).
-- The provider is re-registered when a subagent's teardown removes it (upstream #91).
+- The provider is re-registered when omp's source-scoped subagent teardown removes it.
+  This is separate from upstream [#91](https://github.com/elidickinson/pi-claude-bridge/issues/91),
+  which concerns prompt capture in Pi subagents.
 
 **New here:**
 
@@ -62,6 +64,9 @@ Upstream's omp port has not been updated since July 2026, so the fixes below liv
   history at all (upstream #55/#62 reached by a different route). A new reentrant query imports
   its own history into a private session without rebuilding or adopting the shared session.
   That private snapshot is removed on completion, abort or error.
+- **Child lifecycle events and idle recaps cannot reset the main session.** Lifecycle ownership
+  follows omp's session-manager object; side-channel requests use their own non-persistent
+  snapshot, even while the main thread is idle. Neither consumes the main thread's prewarm.
 - **Compaction is left to omp.** Taking it over runs inside an extension handler the host aborts
   at 30 seconds — not enough for a real context, and a discarded takeover left the session
   uncompacted. Declining hands the summary to omp's normal provider path, which has no deadline.
@@ -327,6 +332,27 @@ Config is read from `~/.omp/agent/claude-bridge.json` (global) and the project O
 ## How it works
 
 OMP's built-in tools are bridged to Claude Code and back, so from your side it behaves like any other OMP provider. Model routing lives in [`src/models.ts`](src/models.ts), which is deliberately free of runtime imports so the context-window policy stays unit-testable in isolation. On registration, the extension projects the pi-ai model list, applies the selected context-window policy, and registers the resulting models with OMP.
+### Session ownership and side requests
+
+In omp 18.2.11, extension event contexts carry the session's `sessionManager`. The bridge pins
+the main manager's object identity: its `/new`, switch and branch operations can change session
+IDs/files without changing the owner. A child manager cannot clear the main transcript,
+cursor, rebuild flags or prewarm. Child shutdown still re-registers the owning provider after
+omp's shared-registry teardown. Real main shutdown releases ownership; queries finishing after
+a main reset cannot restore the invalidated session.
+
+The idle recap calls [`runEphemeralTurn`](https://github.com/can1357/oh-my-pi/blob/v18.2.11/packages/coding-agent/src/modes/controllers/event-controller.ts#L2437-L2458).
+That method supplies a distinct [`options.sessionId` namespace, `<session>:side:…`](https://github.com/can1357/oh-my-pi/blob/v18.2.11/packages/coding-agent/src/session/agent-session.ts#L9378-L9423).
+The bridge checks this metadata **before** matching tool results or synchronizing history.
+Side requests get a private query context and imported snapshot, disable SDK persistence,
+and remove temporary session files on completion, abort or error. This also covers other omp
+requests using the same namespace; it does not guess from `<recap>` text or prompt length.
+
+Recaps still make model requests and can consume subscription quota. Isolation prevents them
+from rebuilding the main transcript; it does not guarantee a prompt-cache hit or a free recap.
+To stop idle recap requests entirely, optionally set `recap.enabled: false` in **omp's settings**
+(not `claude-bridge.json`). The fix does not change that setting or the idle interval.
+
 
 ## Debugging
 
