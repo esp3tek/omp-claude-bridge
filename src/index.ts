@@ -5,7 +5,7 @@ import { keyHint } from "@oh-my-pi/pi-tui/chrome";
 import { buildSessionContext } from "@oh-my-pi/pi-coding-agent/session/session-context";
 import type { CompactionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { compact } from "@oh-my-pi/pi-agent-core/compaction";
-import { query, startup, type EffortLevel, type SDKMessage, type SDKUserMessage, type SettingSource, type WarmQuery } from "@anthropic-ai/claude-agent-sdk";
+import { query, startup, type EffortLevel, type Query, type SDKMessage, type SDKUserMessage, type SettingSource, type WarmQuery } from "@anthropic-ai/claude-agent-sdk";
 import type { ContentBlockParam, MessageParam } from "@anthropic-ai/sdk/resources";
 import { Text } from "@oh-my-pi/pi-tui";
 import { createSession, deleteSession, repairToolPairing } from "cc-session-io";
@@ -631,14 +631,30 @@ function syncSharedSession(
 	// input after them, which a count-based resume cannot express.
 	if (forceRebuild) debug(`syncSharedSession: pending input interleaved with tool results, rebuilding`);
 
-	// A reentrant call (subagent, side query) is decided first, before REUSE can
-	// hand it the parent's session id. It gets a throwaway clean start and never
-	// touches the shared session: not its id, not its file, not its cursor. A
-	// child's own history must not become the main conversation's either, so
-	// this holds even when no shared session exists yet. The child keeps its
-	// context through its live query (tool results come back on the same
-	// query), so it loses nothing by not resuming.
+	// Decide child ownership before REUSE can hand it the parent's session.
+	// A live query retains context across tools, but an unexpected-stop reminder
+	// starts another query. Resume the child's explicit history in its own fresh
+	// snapshot, even before the main session exists. Never touch shared state or
+	// prewarm here; the caller owns cleanup of this snapshot.
 	if (isReentrant) {
+		if (priorMessages.length > 0) {
+			const session = createSession({
+				projectPath: cwd,
+				claudeDir: process.env.CLAUDE_CONFIG_DIR,
+				...(modelId ? { model: modelId } : {}),
+			});
+			try {
+				convertAndImportMessages(session, priorMessages, customToolNameToSdk);
+				session.save();
+				verifyWrittenSession(session.jsonlPath, session.sessionId, session.messages.length, cwd);
+			} catch (error) {
+				deleteSession(session.sessionId, cwd, process.env.CLAUDE_CONFIG_DIR);
+				throw error;
+			}
+			debug(`Case 2 synthetic: reentrant history → ephemeral session ${session.sessionId.slice(0, 8)}, ${session.messages.length} records`);
+			debug(`syncResult: path=ephemeral-resume preserve-shared reentrant sessionId=${session.sessionId} priors=${priorMessages.length}`);
+			return { sessionId: session.sessionId, preserveSharedSession: true };
+		}
 		debug(`Case 1 synthetic: reentrant context, clean start${sharedSession ? `, preserving shared session ${sharedSession.sessionId.slice(0, 8)} (cursor=${sharedSession.cursor})` : ", no shared session yet"}`);
 		debug(`syncResult: path=clean-start preserve-shared reentrant priors=${priorMessages.length}`);
 		return { sessionId: null, preserveSharedSession: true };
@@ -688,6 +704,7 @@ function syncSharedSession(
 	}
 	const previousSessionId = sharedSession?.sessionId;
 	const previousCursor = sharedSession?.cursor ?? 0;
+	const rebuildRequested = sharedSession?.needsRebuild;
 	// preserveId: rebuild in place (deleteSession + createSession with the
 	// existing UUID), so prompt-cache UUIDs stay stable for log correlation
 	// and for any tools that key off them. Skipped only when there's a
@@ -713,7 +730,10 @@ function syncSharedSession(
 		debug(`Case 2: first turn with ${priorMessages.length} prior messages → session ${session.sessionId.slice(0, 8)}, ${session.messages.length} records`);
 	} else if (preserveId) {
 		const missedCount = priorMessages.length - previousCursor;
-		debug(`Case 4: ${missedCount < 0 ? `drift, ${-missedCount} shorter than cursor` : `${missedCount} missed messages`}, ${priorMessages.length} total → rewrote session ${session.sessionId.slice(0, 8)} (same id), ${session.messages.length} records`);
+		const reason = rebuildRequested ? "needsRebuild (compaction/tree/missed input)"
+			: forceRebuild ? "interleaved input"
+			: missedCount < 0 ? `drift, ${-missedCount} shorter than cursor` : `${missedCount} missed messages`;
+		debug(`Case 4: ${reason}, ${priorMessages.length} total → rewrote session ${session.sessionId.slice(0, 8)} (same id), ${session.messages.length} records`);
 	} else {
 		debug(`Case 4 post-abort: ${priorMessages.length} total → new session ${session.sessionId.slice(0, 8)} (was ${previousSessionId.slice(0, 8)}, rotated to avoid race with orphan writer), ${session.messages.length} records`);
 	}
@@ -1200,16 +1220,23 @@ function processAssistantMessage(message: SDKMessage, model: Model<any>, customT
  *  whichever path handles it first (processStreamEvent or processAssistantMessage),
  *  and the MCP handler blocks the generator until pi delivers the tool result. */
 async function consumeQuery(
-	sdkQuery: ReturnType<typeof query>,
+	sdkQuery: Query,
 	customToolNameToPi: Map<string, string>,
 	model: Model<any>,
 	wasAborted: () => boolean,
 	queryCtx: QueryContext,
-): Promise<{ capturedSessionId?: string }> {
+	captureSessionId: (sessionId: string) => void,
+): Promise<void> {
 	let capturedSessionId: string | undefined;
 
 	try {
 	for await (const message of sdkQuery) {
+		// Retain the ID for cleanup even if a later message throws, the host
+		// stream already ended on tool_use, or an abort arrived before init.
+		if (message.type === "system" && message.subtype === "init" && message.session_id) {
+			capturedSessionId = message.session_id;
+			captureSessionId(capturedSessionId);
+		}
 		if (wasAborted()) break;
 		// Nothing else closes the CLI's stdin now that the prompt is a parked
 		// generator: end it on the result, and do it before the stream guard
@@ -1256,9 +1283,6 @@ async function consumeQuery(
 				}
 				break;
 			case "system":
-				if ((message as any).subtype === "init" && (message as any).session_id) {
-					capturedSessionId = (message as any).session_id;
-				}
 				break;
 			case "user":
 				break; // SDK echo of user prompt — not needed
@@ -1289,8 +1313,6 @@ async function consumeQuery(
 
 	// DEBUG: trace when consumeQuery exits
 	debug(`consumeQuery: for-await loop exited, wasAborted=${wasAborted()}, capturedSessionId=${capturedSessionId?.slice(0, 8) ?? "none"}`);
-
-	return { capturedSessionId };
 }
 
 // --- Pre-warmed next process ---
@@ -1470,9 +1492,11 @@ async function deliverToolResults(
 		} else {
 			debug(`WARNING: tool result without toolCallId, cannot match`);
 		}
-		if (c.pendingToolCalls.size > 0 && c.pendingResults.size > 0) {
-			debug(`BUG: both maps non-empty! handlers=${c.pendingToolCalls.size} results=${c.pendingResults.size}`);
-		}
+	}
+	// Disjoint IDs can legitimately be queued while other handlers wait. Only
+	// the same ID in both maps means a deliverable result was left unresolved.
+	for (const id of c.pendingResults.keys()) {
+		if (c.pendingToolCalls.has(id)) debug(`BUG: unmatched tool result and handler for [${id}] after delivery`);
 	}
 	if (c.pendingToolCalls.size > 0) {
 		debug(`WARNING: ${c.pendingToolCalls.size} MCP handlers still waiting after delivering ${results.length} results`);
@@ -1597,10 +1621,8 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 
 	const { mcpTools, customToolNameToSdk, customToolNameToPi } = resolveMcpTools(context, askClaudeToolName);
 	const cwd = (options as { cwd?: string } | undefined)?.cwd ?? process.cwd();
-	const syncResult = syncSharedSession(pendingInput.history as Context["messages"], cwd, customToolNameToSdk, model.id, isReentrant, pendingInput.interleaved);
-	const { sessionId: resumeSessionId } = syncResult;
-	const ownsSharedSession = !isReentrant && !syncResult.preserveSharedSession;
-	queryCtx.ownsSharedSession = ownsSharedSession;
+	const claudeDir = process.env.CLAUDE_CONFIG_DIR;
+	const parentSessionId = sharedSession?.sessionId;
 	const promptBlocks = pendingInput.blocks.length ? (pendingInput.blocks as ContentBlockParam[]) : null;
 	let promptText = "";
 	if (pendingInput.pendingIndices.length > 1 || context.messages[pendingInput.pendingIndices[0]]?.role === "developer") {
@@ -1717,21 +1739,52 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		...(effort ? { effort } : {}),
 		...(settingSources ? { settingSources } : {}),
 		...(mcpServers ? { mcpServers } : {}),
-		...(resumeSessionId ? { resume: resumeSessionId } : {}),
 		...(claudeExecutable ? { pathToClaudeCodeExecutable: claudeExecutable } : {}),
 		...makeCliDebugOptions("provider"),
 	};
 
-	debug("provider: fresh query",
-		`model=${cliModel} msgs=${context.messages.length} tools=${mcpTools.length}`,
-		`resume=${resumeSessionId?.slice(0, 8) ?? "none"} effort=${effort ?? "default"} reasoning=${options?.reasoning ?? "none"}`,
-		`appendSys=${appendSystemPrompt} sysPrompt=${hostOnlyPrompt ? "host" : "preset"} settings=${settingSources ? JSON.stringify(settingSources) : "all"} strictMcp=${strictMcpConfigEnabled}`,
-		`prompt=${(promptBlocks ? promptBlocks.map((b) => (b.type === "text" ? b.text : `[${b.type}]`)).join(" ") : promptText).slice(0, 60)}`);
+	let resumeSessionId: string | null = null;
+	let capturedSessionId: string | undefined;
+	let ownsSharedSession = !isReentrant;
+	const cleanupEphemeralSessions = () => {
+		if (ownsSharedSession) return;
+		if (resumeSessionId && resumeSessionId !== parentSessionId && resumeSessionId !== sharedSession?.sessionId) {
+			deleteSession(resumeSessionId, cwd, claudeDir);
+			debug(`provider: deleted ephemeral resume session ${resumeSessionId.slice(0, 8)}`);
+		}
+		if (capturedSessionId && capturedSessionId !== resumeSessionId && capturedSessionId !== parentSessionId && capturedSessionId !== sharedSession?.sessionId) {
+			deleteSession(capturedSessionId, cwd, claudeDir);
+			debug(`provider: deleted ephemeral captured session ${capturedSessionId.slice(0, 8)}`);
+		}
+	};
 
-	// 3. Start SDK query and claim it for this context
+	// 3. Import and start the SDK query under one cleanup boundary. Construct
+	// options first so an earlier setup error cannot strand an imported file.
 	let wasAborted = false;
-	const warm = ownsSharedSession ? takeWarm(warmKey(queryOptions as Record<string, unknown>, mcpTools)) : null;
-	const sdkQuery = warm ? warm.query(prompt) : query({ prompt, options: queryOptions });
+	let sdkQuery: Query;
+	try {
+		const syncResult = syncSharedSession(pendingInput.history as Context["messages"], cwd, customToolNameToSdk, model.id, isReentrant, pendingInput.interleaved);
+		resumeSessionId = syncResult.sessionId;
+		ownsSharedSession = !isReentrant && !syncResult.preserveSharedSession;
+		queryCtx.ownsSharedSession = ownsSharedSession;
+		if (resumeSessionId) queryOptions.resume = resumeSessionId;
+		// Rebuild child history from omp each time. Disable CLI writes so
+		// abort/startup failure cannot leave or recreate an isolated transcript.
+		if (!ownsSharedSession) queryOptions.persistSession = false;
+		debug("provider: fresh query",
+			`model=${cliModel} msgs=${context.messages.length} tools=${mcpTools.length}`,
+			`resume=${resumeSessionId?.slice(0, 8) ?? "none"} effort=${effort ?? "default"} reasoning=${options?.reasoning ?? "none"}`,
+			`appendSys=${appendSystemPrompt} sysPrompt=${hostOnlyPrompt ? "host" : "preset"} settings=${settingSources ? JSON.stringify(settingSources) : "all"} strictMcp=${strictMcpConfigEnabled}`,
+			`prompt=${(promptBlocks ? promptBlocks.map((b) => (b.type === "text" ? b.text : `[${b.type}]`)).join(" ") : promptText).slice(0, 60)}`);
+		const warm = ownsSharedSession ? takeWarm(warmKey(queryOptions as Record<string, unknown>, mcpTools)) : null;
+		sdkQuery = warm ? warm.query(prompt) : query({ prompt, options: queryOptions });
+	} catch (error) {
+		promptStream.fail(error instanceof Error ? error : new Error(String(error)));
+		queryCtx.promptStream = null;
+		queryCtx.currentPiStream = null;
+		cleanupEphemeralSessions();
+		throw error;
+	}
 	queryCtx.activeQuery = sdkQuery;
 	activeQueryContexts.add(queryCtx);
 
@@ -1758,8 +1811,15 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	}
 
 	// Background consumer — runs until query ends
-	consumeQuery(sdkQuery, customToolNameToPi, model, () => wasAborted, queryCtx)
-		.then(async ({ capturedSessionId }) => {
+	consumeQuery(sdkQuery, customToolNameToPi, model, () => wasAborted, queryCtx, (id) => { capturedSessionId = id; })
+		.finally(() => {
+			if (ownsSharedSession) return;
+			// Close before deleting, and clean up before publishing a terminal
+			// stream event. This runs on success, abort and consumer errors,
+			// including failures before the SDK reports its init/session ID.
+			try { sdkQuery.close(); } finally { cleanupEphemeralSessions(); }
+		})
+		.then(() => {
 			debug(`provider: consumeQuery completed, stopReason=${queryCtx.turnOutput?.stopReason}, error=${queryCtx.turnOutput?.errorMessage}, aborted=${wasAborted}`);
 
 			// --- Abort detection in normal completion path ---
@@ -1784,10 +1844,6 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			// a child that finishes after its parent would otherwise hand the next
 			// main turn a --resume onto the child's own history.
 			if (!ownsSharedSession) {
-				if (capturedSessionId && capturedSessionId !== sharedSession?.sessionId) {
-					deleteSession(capturedSessionId, cwd, process.env.CLAUDE_CONFIG_DIR);
-					debug(`provider: query done, deleted ephemeral session ${capturedSessionId.slice(0, 8)} to preserve shared session`);
-				}
 				debug(`provider: query done, ignoring captured session ${capturedSessionId?.slice(0, 8) ?? "none"} to preserve shared session${isReentrant ? " (reentrant)" : ""}`);
 			} else if (sessionId) {
 				const cursor = Math.max(context.messages.length, queryCtx.latestCursor, sharedSession?.cursor ?? 0);
@@ -1861,7 +1917,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			}
 			// Ending the stream can start the next query before this finally runs.
 			if (!queryCtx.activeQuery) activeQueryContexts.delete(queryCtx);
-			sdkQuery.close();
+			if (ownsSharedSession) sdkQuery.close();
 		});
 
 	return stream;

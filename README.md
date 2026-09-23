@@ -59,8 +59,9 @@ Upstream's omp port has not been updated since July 2026, so the fixes below liv
   hooks and skills no longer load on every turn.
 - **Context is never silently lost.** A main-thread context shorter than the session cursor now
   rebuilds the Claude Code session instead of starting clean, which used to run a turn with no
-  history at all (upstream #55/#62 reached by a different route). Reentrant calls never rebuild
-  or adopt the shared session.
+  history at all (upstream #55/#62 reached by a different route). A new reentrant query imports
+  its own history into a private session without rebuilding or adopting the shared session.
+  That private snapshot is removed on completion, abort or error.
 - **Compaction is left to omp.** Taking it over runs inside an extension handler the host aborts
   at 30 seconds — not enough for a real context, and a discarded takeover left the session
   uncompacted. Declining hands the summary to omp's normal provider path, which has no deadline.

@@ -9,14 +9,14 @@ bun test tests/*.test.ts
 
 | File | Covers |
 | ---- | ------ |
-| `session-drift.test.ts` | `syncSharedSession` with explicit history: shortened main contexts rebuild; reentrant and zero-prior side requests preserve the shared session |
+| `session-drift.test.ts` | `syncSharedSession` with explicit history: shortened main contexts rebuild; reentrant history gets a private session; zero-prior side requests preserve the shared session |
 | `thinking.test.ts` | Historical thinking replay and unique, stable tool IDs after sanitization |
 | `pack.test.ts` | Condensing omp's real tool descriptions (`fixtures-omp-tools.json`) under Claude Code's 2048-character limit while keeping `<critical>` and the examples |
 | `prompt-stream.test.ts` | The stdin generator: acks resolve on delivery, and abandoning the consumer settles every queued push instead of leaving it pending |
 | `usage.test.ts` | Quota from SDK rate-limit events: `unifiedWindows` fractions, the documented percentage fallback, stale windows, values on an unknown scale |
 | `claude-models.test.ts` | Collapsing Claude Code's picker entries into base model ids and 1M capability |
 | `developer-input.test.ts` | Developer markers, multiple pending inputs, interleaved results, lossless images and rebuilt tool pairing |
-| `developer-routing.test.ts` | Real provider routing with simulated SDK `query`/`startup`: developer input during MCP execution, write-ack ordering, duplicate callbacks, orphans, aborts, side-query isolation, prewarm reuse and AskClaude history |
+| `developer-routing.test.ts` | Real provider routing with simulated SDK `query`/`startup`: developer input during MCP execution, write-ack ordering, duplicate callbacks, orphans, aborts, prewarm reuse and AskClaude history; child-history replay and parent isolation; private-file cleanup on completion without init, iterator/startup errors and aborts |
 
 The routing fixture runs the production provider and MCP routing closures, not helper-only
 approximations. It replaces SDK transport and the host event sink, so it exercises no live

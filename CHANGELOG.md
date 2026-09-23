@@ -4,6 +4,25 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.4] - 2026-09-23
+
+### Fixed
+- **Subagents lost their history after an unexpected-stop reminder.** A reentrant
+  query with prior messages now imports its own history into a fresh, ephemeral
+  Claude Code session and resumes it, rather than sending only the latest
+  developer reminder. This also works before the main session exists, without
+  changing the shared session, its cursor/rebuild flags, or its prewarmed process.
+  Zero-history side requests still start clean.
+- Ephemeral session snapshots and companion directories are cleaned up on success,
+  abort, SDK errors, and synchronous query-start failures, even without an SDK init
+  message. Isolated queries disable SDK persistence to prevent late abort writes
+  from recreating deleted transcripts.
+- Parallel tool-result delivery no longer reports `BUG: both maps non-empty` for
+  unrelated tool IDs. The diagnostic checks for an unresolved result and handler
+  with the same ID after the batch has been delivered.
+- Session rebuild logs distinguish explicit `needsRebuild` (including compaction)
+  and interleaved input from unannounced cursor drift.
+
 ## [0.9.3] - 2026-09-23
 
 ### Added

@@ -1,6 +1,7 @@
 import { afterAll, afterEach, beforeEach, expect, mock, test } from "bun:test";
-import { mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync } from "fs";
-import { join } from "path";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "fs";
+import { dirname, join } from "path";
+import { createSession, getSessionPath, readSession } from "cc-session-io";
 import type { AssistantMessageEventStream, Context, Model } from "@oh-my-pi/pi-coding-agent/extensibility/legacy-pi-ai-shim";
 import { DEVELOPER_CLOSE, DEVELOPER_OPEN } from "../src/convert.ts";
 import { resetStack } from "../src/query-state.ts";
@@ -48,6 +49,7 @@ const runs: Run[] = [];
 const queryCalls: QueryArgs[] = [];
 const queries: FakeQuery[] = [];
 let startWarm: ((options: QueryOptions) => Promise<FakeWarm>) | undefined;
+let synchronousQueryError: Error | undefined;
 const sdkModule = { ...originalSdk };
 const hostModule = { ...originalHost };
 const mcpModule = { ...originalMcp };
@@ -55,9 +57,10 @@ const osModule = { ...originalOs };
 
 mock.module("@anthropic-ai/claude-agent-sdk", () => ({
 	query: (args: QueryArgs) => {
+		queryCalls.push(args);
+		if (synchronousQueryError) throw synchronousQueryError;
 		const run = runs.shift();
 		if (!run) throw new Error("unexpected SDK query");
-		queryCalls.push(args);
 		const query = new FakeQuery(args, run);
 		queries.push(query);
 		return query;
@@ -102,6 +105,88 @@ const context = (messages: HostMessage[], tools: HostTool[] = []) => ({ messages
 
 function promptText(message: PromptMessage): string {
 	return message.message.content.filter((block) => block.type === "text").map((block) => block.text ?? "").join("\n");
+}
+type ImportedSession = { path: string; companion: string; content: (string | unknown[])[] };
+function importedSession(sessionId: string | undefined): ImportedSession | null {
+	if (!sessionId) return null;
+	const path = getSessionPath(sessionId, root, root);
+	if (!existsSync(path)) return null;
+	const content = readSession(path).messages.map((record) => record.message.content);
+	const companion = join(dirname(path), sessionId);
+	mkdirSync(companion, { recursive: true });
+	writeFileSync(join(companion, "child-artifact"), "SDK artifact");
+	return { path, companion, content };
+}
+function requireImported(session: ImportedSession | null): ImportedSession {
+	if (!session) throw new Error("SDK did not see its imported child resume file");
+	return session;
+}
+
+type ParentSession = { shared: { sessionId: string; cursor: number; cwd: string; needsRebuild: boolean; forceRotate: boolean }; path: string; bytes: string };
+function parentSession() {
+	const session = createSession({ projectPath: root, claudeDir: root });
+	session.addUserMessage("parent history marker");
+	session.addAssistantMessage([{ type: "text", text: "parent answered earlier" }]);
+	session.save();
+	const shared = { sessionId: session.sessionId, cursor: 2, cwd: root, needsRebuild: false, forceRotate: false };
+	T.setSharedSession({ ...shared });
+	return { shared, path: session.jsonlPath, bytes: readFileSync(session.jsonlPath, "utf8") };
+}
+
+async function holdParent(parent?: ParentSession) {
+	const started = new Deferred<undefined>();
+	runs.push(async function* ({ prompt }, query) {
+		if (typeof prompt !== "string") await prompt[Symbol.asyncIterator]().next();
+		started.resolve(undefined);
+		await query.closed.promise;
+	});
+	const history = parent ? [
+		u("parent history marker"),
+		{ role: "assistant", content: [{ type: "text", text: "parent answered earlier" }], stopReason: "stop", timestamp: 1 },
+	] : [];
+	const stream = terminalEvent(T.streamClaudeAgentSdk(model, context([...history, u("parent active")]), { cwd: root }));
+	await started.promise;
+	if (parent) {
+		expect(queryCalls[0]?.options.resume).toBe(parent.shared.sessionId);
+		// Invalidation may arrive while the owning parent is still running.
+		parent.shared.needsRebuild = true;
+		parent.shared.forceRotate = true;
+		T.setSharedSession({ ...parent.shared });
+	}
+	return stream;
+}
+
+function childHistory(withDelegation = true) {
+	return [
+		u("prior child task"), d("historical harness instruction"), a("child-tool"),
+		result("child-tool", "real child tool output"),
+		{ role: "assistant", content: [{ type: "text", text: "child answered earlier" }], stopReason: "stop", timestamp: 1 },
+		...(withDelegation ? [u("new child delegation")] : []), d("current child reminder"),
+	];
+}
+function expectChildHistory(content: (string | unknown[])[]) {
+	const serialized = JSON.stringify(content);
+	expect(serialized).toContain("prior child task");
+	expect(serialized).toContain(JSON.stringify(`${DEVELOPER_OPEN}historical harness instruction${DEVELOPER_CLOSE}`).slice(1, -1));
+	expect(serialized).toContain('"type":"tool_use"');
+	expect(serialized).toContain('"id":"child-tool"');
+	expect(serialized).toContain('"type":"tool_result"');
+	expect(serialized).toContain('"tool_use_id":"child-tool"');
+	expect(serialized).toContain("real child tool output");
+	expect(serialized).toContain("child answered earlier");
+	expect(serialized).not.toContain("new child delegation");
+	expect(serialized).not.toContain("current child reminder");
+}
+function expectRemoved(sessionId: string | undefined) {
+	if (!sessionId) throw new Error("expected isolated resume ID");
+	const path = getSessionPath(sessionId, root, root);
+	expect(existsSync(path)).toBe(false);
+	expect(existsSync(join(dirname(path), sessionId))).toBe(false);
+}
+
+function expectParentUnchanged(parent: ParentSession) {
+	expect(T.getSharedSession()).toEqual(parent.shared);
+	expect(readFileSync(parent.path, "utf8")).toBe(parent.bytes);
 }
 
 function terminalEvent(stream: unknown): FakeAssistantStream {
@@ -174,6 +259,7 @@ beforeEach(() => {
 	queryCalls.length = 0;
 	queries.length = 0;
 	runs.length = 0;
+	synchronousQueryError = undefined;
 	startWarm = undefined;
 	T.clearSession();
 	resetStack();
@@ -571,4 +657,254 @@ test("a mid-run compaction's shorter context still delivers its new tool results
 	expect(state.results).toHaveLength(1);
 	state.finish.resolve(undefined);
 	await stream.ended.promise;
+});
+
+test("active parent keeps its shared session while a child resumes full history and reminder, then removes its own artifacts without init", async () => {
+	const parent = parentSession();
+	const parentStream = await holdParent(parent);
+	try {
+		const started = new Deferred<undefined>();
+		const finish = new Deferred<undefined>();
+		let imported: ImportedSession | null = null;
+		const prompts: PromptMessage[] = [];
+		runs.push(async function* ({ prompt, options }) {
+			imported = importedSession(options.resume);
+			if (typeof prompt !== "string") prompts.push((await prompt[Symbol.asyncIterator]().next()).value);
+			started.resolve(undefined);
+			await finish.promise;
+			yield { type: "result", subtype: "success", result: "child done without init" };
+		});
+		const child = terminalEvent(T.streamClaudeAgentSdk(model, context(childHistory(false), [tool]), { cwd: root }));
+		await started.promise;
+		try {
+			const resume = queryCalls[1]?.options.resume;
+			expect(resume).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+			expect(resume).not.toBe(parent.shared.sessionId);
+			expectChildHistory(requireImported(imported).content);
+			expect(prompts.map(promptText)).toEqual([`${DEVELOPER_OPEN}current child reminder${DEVELOPER_CLOSE}`]);
+			expectParentUnchanged(parent);
+			expect(existsSync(requireImported(imported).companion)).toBe(true);
+		} finally {
+			finish.resolve(undefined);
+		}
+		await child.ended.promise;
+		await queries[1]!.closed.promise;
+		expect(child.events.at(-1)).toMatchObject({ type: "done", reason: "stop" });
+		expectRemoved(queryCalls[1]?.options.resume);
+		expectParentUnchanged(parent);
+	} finally {
+		queries[0]?.close();
+		await parentStream.ended.promise;
+	}
+});
+
+test("active parent without a shared session stays unpublished while a child receives full imported history", async () => {
+	const parentStream = await holdParent();
+	try {
+		const started = new Deferred<undefined>();
+		const finish = new Deferred<undefined>();
+		let imported: ImportedSession | null = null;
+		const capturedId = "81234567-1234-4234-8234-123456789abc";
+		const prompts: PromptMessage[] = [];
+		runs.push(async function* ({ prompt, options }) {
+			imported = importedSession(options.resume);
+			if (typeof prompt !== "string") prompts.push((await prompt[Symbol.asyncIterator]().next()).value);
+			const captured = createSession({ projectPath: root, claudeDir: root, sessionId: capturedId });
+			captured.addUserMessage("SDK captured session artifact");
+			captured.save();
+			mkdirSync(join(dirname(captured.jsonlPath), capturedId), { recursive: true });
+			started.resolve(undefined);
+			await finish.promise;
+			yield { type: "system", subtype: "init", session_id: capturedId };
+			yield { type: "result", subtype: "success", result: "child done" };
+		});
+		const child = terminalEvent(T.streamClaudeAgentSdk(model, context(childHistory(), [tool]), { cwd: root }));
+		await started.promise;
+		try {
+			const resume = queryCalls[1]?.options.resume;
+			expect(resume).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+			expect(resume).not.toBe(capturedId);
+			expectChildHistory(requireImported(imported).content);
+			expect(prompts.map(promptText)).toEqual([`new child delegation\n${DEVELOPER_OPEN}current child reminder${DEVELOPER_CLOSE}`]);
+			expect(T.getSharedSession()).toBeNull();
+		} finally {
+			finish.resolve(undefined);
+		}
+		await child.ended.promise;
+		expect(child.events.at(-1)).toMatchObject({ type: "done", reason: "stop" });
+		await queries[1]!.closed.promise;
+		expectRemoved(queryCalls[1]?.options.resume);
+		expectRemoved(capturedId);
+		expect(T.getSharedSession()).toBeNull();
+	} finally {
+		queries[0]?.close();
+		await parentStream.ended.promise;
+	}
+});
+
+test("child iterator error before init removes imported history without changing its active parent", async () => {
+	const parent = parentSession();
+	const parentStream = await holdParent(parent);
+	try {
+		let imported: ImportedSession | null = null;
+		runs.push(async function* ({ options }) {
+			imported = importedSession(options.resume);
+			throw new Error("child iterator failed before init");
+		});
+		const child = terminalEvent(T.streamClaudeAgentSdk(model, context(childHistory(), [tool]), { cwd: root }));
+		await child.ended.promise;
+		expect(child.events.at(-1)).toMatchObject({ type: "error" });
+		await queries[1]!.closed.promise;
+		expectChildHistory(requireImported(imported).content);
+		expectRemoved(queryCalls[1]?.options.resume);
+		expectParentUnchanged(parent);
+	} finally {
+		queries[0]?.close();
+		await parentStream.ended.promise;
+	}
+});
+
+test("aborting a child removes both imported history and a different captured SDK session", async () => {
+	const parent = parentSession();
+	const parentStream = await holdParent(parent);
+	try {
+		const started = new Deferred<undefined>();
+		const capturedId = "91234567-1234-4234-8234-123456789abc";
+		let imported: ImportedSession | null = null;
+		runs.push(async function* ({ options }, query) {
+			imported = importedSession(options.resume);
+			const captured = createSession({ projectPath: root, claudeDir: root, sessionId: capturedId });
+			captured.addUserMessage("SDK captured before child abort");
+			captured.save();
+			mkdirSync(join(dirname(captured.jsonlPath), capturedId), { recursive: true });
+			yield { type: "system", subtype: "init", session_id: capturedId };
+			started.resolve(undefined);
+			await query.closed.promise;
+		});
+		const controller = new AbortController();
+		const child = terminalEvent(T.streamClaudeAgentSdk(model, context(childHistory(), [tool]), { cwd: root, signal: controller.signal }));
+		await started.promise;
+		try {
+			expectChildHistory(requireImported(imported).content);
+			expect(queryCalls[1]?.options.resume).not.toBe(parent.shared.sessionId);
+			expectParentUnchanged(parent);
+		} finally {
+			controller.abort();
+		}
+		await child.ended.promise;
+		await queries[1]!.closed.promise;
+		expect(child.events.at(-1)).toMatchObject({ type: "error", error: { stopReason: "aborted" } });
+		expectRemoved(queryCalls[1]?.options.resume);
+		expectRemoved(capturedId);
+		expectParentUnchanged(parent);
+	} finally {
+		queries[0]?.close();
+		await parentStream.ended.promise;
+	}
+});
+
+test("a synchronous SDK query throw removes the imported child session and companion", async () => {
+	const parent = parentSession();
+	const parentStream = await holdParent(parent);
+	try {
+		synchronousQueryError = new Error("SDK query setup failed");
+		expect(() => T.streamClaudeAgentSdk(model, context(childHistory(), [tool]), { cwd: root }))
+			.toThrow("SDK query setup failed");
+		expect(queryCalls[1]?.options.resume).not.toBe(parent.shared.sessionId);
+		expectRemoved(queryCalls[1]?.options.resume);
+		expectParentUnchanged(parent);
+	} finally {
+		synchronousQueryError = undefined;
+		queries[0]?.close();
+		await parentStream.ended.promise;
+	}
+});
+
+for (const failure of ["iterator error", "abort"] as const) {
+	test(`zero-prior side request cleans a captured SDK session on ${failure} without touching the active parent`, async () => {
+		const parent = parentSession();
+		const parentStream = await holdParent(parent);
+		try {
+			const capturedId = failure === "abort" ? "a1234567-1234-4234-8234-123456789abc" : "b1234567-1234-4234-8234-123456789abc";
+			const started = new Deferred<undefined>();
+			runs.push(async function* (_args, query) {
+				const captured = createSession({ projectPath: root, claudeDir: root, sessionId: capturedId });
+				captured.addUserMessage("SDK zero-prior artifact");
+				captured.save();
+				mkdirSync(join(dirname(captured.jsonlPath), capturedId), { recursive: true });
+				yield { type: "system", subtype: "init", session_id: capturedId };
+				started.resolve(undefined);
+				if (failure === "abort") await query.closed.promise;
+				else throw new Error("zero-prior SDK iteration failed");
+			});
+			const controller = new AbortController();
+			const child = terminalEvent(T.streamClaudeAgentSdk(model, context([u("new side request")]), { cwd: root, signal: controller.signal }));
+			await started.promise;
+			expect(queryCalls[1]?.options.resume).toBeUndefined();
+			if (failure === "abort") controller.abort();
+			await child.ended.promise;
+			await queries[1]!.closed.promise;
+			expect(child.events.at(-1)).toMatchObject({ type: "error", error: { stopReason: failure === "abort" ? "aborted" : "error" } });
+			expectRemoved(capturedId);
+			expectParentUnchanged(parent);
+		} finally {
+			queries[0]?.close();
+			await parentStream.ended.promise;
+		}
+	});
+}
+
+test("a history-bearing child leaves its active parent's warmed SDK process intact", async () => {
+	let warmUses = 0;
+	let warmCloses = 0;
+	const parentStarted = new Deferred<undefined>();
+	startWarm = async (options) => ({
+		query(prompt) {
+			warmUses++;
+			const query = new FakeQuery({ prompt, options }, async function* (_args, active) {
+				parentStarted.resolve(undefined);
+				await active.closed.promise;
+			});
+			queries.push(query);
+			return query;
+		},
+		close() { warmCloses++; },
+	});
+	runs.push(successRun([]));
+	const initial = terminalEvent(T.streamClaudeAgentSdk(model, context([u("first parent turn")]), { cwd: root }));
+	await initial.ended.promise;
+	await queries[0]!.closed.promise;
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	runs.push(async function* (_args, active) {
+		parentStarted.resolve(undefined);
+		await active.closed.promise;
+	});
+	const parent = terminalEvent(T.streamClaudeAgentSdk(model, context([
+		u("first parent turn"),
+		{ role: "assistant", content: [{ type: "text", text: "finished" }], stopReason: "stop", timestamp: 1 },
+		u("second parent turn"),
+	]), { cwd: root }));
+	try {
+		await parentStarted.promise;
+		expect(warmUses).toBe(1);
+		// The fallback only prevents a failed warm lookup from parking the test.
+		runs.shift();
+		const shared = T.getSharedSession();
+		let imported: ImportedSession | null = null;
+		runs.push(async function* ({ options }) {
+			imported = importedSession(options.resume);
+			yield { type: "result", subtype: "success", result: "child done" };
+		});
+		const child = terminalEvent(T.streamClaudeAgentSdk(model, context(childHistory(), [tool]), { cwd: root }));
+		await child.ended.promise;
+		await queries[2]!.closed.promise;
+		expectChildHistory(requireImported(imported).content);
+		expectRemoved(queryCalls[1]?.options.resume);
+		expect(warmUses).toBe(1);
+		expect(warmCloses).toBe(0);
+		expect(T.getSharedSession()).toEqual(shared);
+	} finally {
+		queries[1]?.close();
+		await parent.ended.promise;
+	}
 });
