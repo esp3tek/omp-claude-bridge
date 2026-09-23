@@ -11,6 +11,8 @@ import { homedir } from "os";
 import { join } from "path";
 
 export interface Config {
+	/** Write ~/.omp/agent/claude-bridge.log like CLAUDE_BRIDGE_DEBUG=1 (read at load, from the global file only). */
+	debug?: boolean;
 	askClaude?: {
 		enabled?: boolean;
 		name?: string;

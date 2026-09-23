@@ -9,7 +9,7 @@ import { query, startup, type EffortLevel, type SDKMessage, type SDKUserMessage,
 import type { ContentBlockParam, MessageParam } from "@anthropic-ai/sdk/resources";
 import { Text } from "@oh-my-pi/pi-tui";
 import { createSession, deleteSession, repairToolPairing } from "cc-session-io";
-import { appendFileSync, mkdirSync, readdirSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from "fs";
+import { appendFileSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from "fs";
 import { homedir } from "os";
 import { dirname, join } from "path";
 import { PROVIDER_ID, messageContentToText, convertPiMessages, importMessagesLossless, splitPendingInput } from "./convert.js";
@@ -44,9 +44,21 @@ function calculateCost(model: Model<any>, usage: Usage): Usage["cost"] {
 }
 
 // --- Debug logging ---
-// CLAUDE_BRIDGE_DEBUG=1 enables debug logging to ~/.omp/agent/claude-bridge.log
+// CLAUDE_BRIDGE_DEBUG=1 enables debug logging to ~/.omp/agent/claude-bridge.log.
+// So does "debug": true in ~/.omp/agent/claude-bridge.json, for hosts launched from
+// a terminal that predates the environment variable (CLAUDE_BRIDGE_DEBUG=0 wins).
 
-const DEBUG = process.env.CLAUDE_BRIDGE_DEBUG === "1";
+function debugFromConfigFile(): boolean {
+	try {
+		const raw = readFileSync(join(homedir(), ".omp", "agent", "claude-bridge.json"), "utf8");
+		return (JSON.parse(raw) as { debug?: unknown }).debug === true;
+	} catch {
+		return false;
+	}
+}
+
+const DEBUG = process.env.CLAUDE_BRIDGE_DEBUG === "1"
+	|| (process.env.CLAUDE_BRIDGE_DEBUG !== "0" && debugFromConfigFile());
 const DEBUG_LOG_PATH = process.env.CLAUDE_BRIDGE_DEBUG_PATH || join(homedir(), ".omp", "agent", "claude-bridge.log");
 const DIAG_LOG_PATH = join(homedir(), ".omp", "agent", "claude-bridge-diag.log");
 

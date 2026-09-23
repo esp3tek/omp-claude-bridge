@@ -4,6 +4,13 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.3] - 2026-09-23
+
+### Added
+- `"debug": true` in `~/.omp/agent/claude-bridge.json` turns on the debug log like
+  `CLAUDE_BRIDGE_DEBUG=1`, for omp sessions started from a terminal that predates the
+  environment variable. `CLAUDE_BRIDGE_DEBUG=0` still forces it off.
+
 ## [0.9.2] - 2026-09-23
 
 ### Fixed
