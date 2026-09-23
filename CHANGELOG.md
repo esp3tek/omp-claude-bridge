@@ -4,6 +4,18 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.2] - 2026-09-23
+
+### Fixed
+- **Mid-run compaction ended the turn with "Assistant returned empty stop after retry
+  cap".** The duplicate tool-result guard added in 0.9.1 compared the context length with
+  the last delivered length. omp compacts between provider calls, so the callback after a
+  compaction carries a shorter context with new tool results; the bridge took it for a
+  duplicate, answered an empty stop three times and left Claude Code waiting on its tool
+  call. Duplicates are now detected by the result ids already handed to the query, and a
+  shrunken context resets the input cursor so a reminder after the compaction is still
+  steered in.
+
 ## [0.9.1] - 2026-09-23
 
 Verified against omp 18.2.9 and Claude Code 2.1.278 on Windows.

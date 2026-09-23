@@ -20,6 +20,9 @@ export class QueryContext {
 	activeQuery: unknown | null = null;
 	currentPiStream: AssistantMessageEventStream | null = null;
 	latestCursor = 0;
+	// Tool results already handed to this query's MCP handlers. A repeated
+	// callback carries only these; a compacted context is shorter but new.
+	deliveredResultIds = new Set<string>();
 	// False for concurrent children and zero-history side requests.
 	ownsSharedSession = false;
 	pendingToolCalls = new Map<string, PendingToolCall>();

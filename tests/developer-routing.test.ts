@@ -545,3 +545,30 @@ test("a side request preserves a parent's pending post-abort rebuild", async () 
 	await side.ended.promise;
 	expect(T.getSharedSession()).toEqual(shared);
 });
+
+test("a mid-run compaction's shorter context still delivers its new tool results", async () => {
+	// Seen live: omp compacted between provider calls, the callback carried a context
+	// shorter than the one last delivered, the bridge took it for a duplicate, and omp
+	// got three empty stops while Claude Code waited on the tool call forever.
+	const state = { prompts: [] as PromptMessage[], results: [] as ToolResult[], ready: new Deferred<undefined>(), delivered: new Deferred<undefined>(), finish: new Deferred<undefined>() };
+	runs.push(toolRun(["tool-1"], state));
+	T.streamClaudeAgentSdk(model, context([u("initial")], [tool]), { cwd: root });
+	await state.ready.promise;
+	T.getMainQueryContext().latestCursor = 40; // a long pre-compaction context was delivered before
+
+	// The reminder after the result also proves the input cursor was reset: with the
+	// stale cursor (40) it sat "before" the delivered position and was never sent.
+	const compacted = context([u("summary of the compacted history"), a(), result("tool-1", "after compaction"), d("post-compaction reminder")], [tool]);
+	const stream = terminalEvent(T.streamClaudeAgentSdk(model, compacted, { cwd: root }));
+	await state.delivered.promise;
+	expect(state.results).toHaveLength(1);
+	expect(JSON.stringify(state.results[0])).toContain("after compaction");
+	expect(promptText(state.prompts[1]!)).toContain(`${DEVELOPER_OPEN}post-compaction reminder${DEVELOPER_CLOSE}`);
+
+	// The same callback again is a real duplicate: nothing new to hand over.
+	const again = terminalEvent(T.streamClaudeAgentSdk(model, compacted, { cwd: root }));
+	await again.ended.promise;
+	expect(state.results).toHaveLength(1);
+	state.finish.resolve(undefined);
+	await stream.ended.promise;
+});

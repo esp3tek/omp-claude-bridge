@@ -1499,9 +1499,15 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// (everything after the last assistant message) and match against waiting MCP
 	// handlers. Results that arrive before their handler get queued in pendingResults.
 	if (resultCtx) {
-		if (context.messages.length <= resultCtx.latestCursor) {
-			// A duplicate callback must not replace the waiting output stream or
-			// release handlers while the original steer push still awaits its ack.
+		// A duplicate callback (every result already delivered) must not replace the
+		// waiting output stream or release handlers while the original steer push
+		// still awaits its ack. Decided by result id, not context length: a mid-run
+		// compaction hands over a SHORTER context carrying new results, and treating
+		// it as a duplicate left Claude Code waiting on its tool call while omp got
+		// an empty stop three times ("Assistant returned empty stop after retry cap").
+		const newResults = allResults.filter((r) => !r.toolCallId || !resultCtx.deliveredResultIds.has(r.toolCallId));
+		if (newResults.length === 0) {
+			debug(`provider: duplicate tool-result callback (${allResults.length} already delivered), ending quietly`);
 			queueMicrotask(() => {
 				stream.push({ type: "done", reason: "stop", message: newAssistantOutput(model, "", "stop") });
 				markStreamComplete(stream);
@@ -1509,6 +1515,13 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			});
 			return stream;
 		}
+		if (context.messages.length < resultCtx.latestCursor) {
+			// omp rewrote the history under the live query (mid-run compaction): the
+			// delivered-input position no longer maps onto this context.
+			debug(`provider: context shrank under the live query (${resultCtx.latestCursor} -> ${context.messages.length}), resetting input cursor`);
+			resultCtx.latestCursor = 0;
+		}
+		for (const r of newResults) if (r.toolCallId) resultCtx.deliveredResultIds.add(r.toolCallId);
 		claimCurrentPiStream(stream, "tool-result", resultCtx);
 		resultCtx.resetTurnState(model);
 		// User messages (steer / followUp) omp injected into context during the
@@ -1517,7 +1530,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		// BEFORE the tool results are released, so CC sees it this turn.
 		// Developer messages (harness reminders) travel the same way, wrapped.
 		const steer = steerBlocks(context.messages, resultCtx);
-		void deliverToolResults(resultCtx, allResults, steer, context.messages.length);
+		void deliverToolResults(resultCtx, newResults, steer, context.messages.length);
 
 		// Only the main conversation's tool results advance the shared cursor: a
 		// subagent's context is shorter, and letting it write here dragged the
@@ -1567,6 +1580,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	queryCtx.pendingResults.clear();
 	queryCtx.resetTurnState(model);
 	queryCtx.latestCursor = 0;
+	queryCtx.deliveredResultIds.clear();
 	queryCtx.inputMissed = false;
 
 	const { mcpTools, customToolNameToSdk, customToolNameToPi } = resolveMcpTools(context, askClaudeToolName);
