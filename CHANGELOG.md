@@ -4,6 +4,36 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.6] - 2026-09-24
+
+### Fixed
+- **Mid-turn compaction now continues the original turn instead of resuming
+  Claude Code against stale history.** omp can replace its messages while a
+  tool call is still pending. The main query records `session_compact` even
+  when it was the first query, then hands off at the matching tool-result
+  callback: it retires the old SDK query, settles pending MCP handlers and
+  imports only omp's retained compacted context, including the actual tool
+  results, into a fresh session. An explicit continuation asks Claude to
+  finish the original work because a tool-result callback need not contain a
+  new user prompt; any pending user or harness input is preserved alongside it.
+  Late output and finalizers from the retired query cannot take back the
+  session. The next tool round can proceed on the rebuilt context.
+- A live handoff uses a new Claude Code session UUID so the old writer cannot
+  append to the replacement JSONL. Idle compaction continues to rebuild in
+  place. The retained-context import leaves discarded history out of the new
+  transcript, but a new UUID/prefix can change prompt-cache behavior; no
+  cache-hit or token-savings percentage is guaranteed. SDK usage is passed
+  through rather than adjusted to make compaction appear smaller. The handoff
+  applies only to the owned main query; child and side requests retain their
+  isolated behavior.
+
+### Tests
+- Added provider-level mid-turn compaction coverage with simulated SDK queries
+  and real session JSONL: tool-result handoff, retained history and input,
+  terminal MCP handlers, late retired-query activity and subsequent tool
+  rounds. This does not exercise a live Claude Code process or measure quota
+  or prompt-cache hits.
+
 ## [0.9.5] - 2026-09-24
 
 ### Fixed

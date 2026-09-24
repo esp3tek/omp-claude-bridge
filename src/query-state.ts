@@ -23,6 +23,13 @@ export class QueryContext {
 	// Tool results already handed to this query's MCP handlers. A repeated
 	// callback carries only these; a compacted context is shorter but new.
 	deliveredResultIds = new Set<string>();
+	// session_compact is authoritative even if its rewritten context has the
+	// same length. The next callback must leave this query's transcript behind.
+	compactionPending = false;
+	// Retired queries may still yield SDK messages or finish asynchronous work.
+	retired = false;
+	// Installed by the SDK query owner; compaction retires it synchronously.
+	retire: (() => void) | null = null;
 	// False for concurrent children and zero-history side requests.
 	ownsSharedSession = false;
 	pendingToolCalls = new Map<string, PendingToolCall>();
@@ -73,6 +80,13 @@ export function pushContext(): void {
 	if (!_ctx.activeQuery) throw new Error("pushContext() called with no active query");
 	contextStack.push(_ctx);
 	_ctx = new QueryContext();
+}
+/** Replace the main query after a live compaction without modifying the
+ *  reentrant context stack or letting old SDK callbacks see the new state. */
+export function replaceMainContext(previous: QueryContext): QueryContext {
+	if (_ctx !== previous || contextStack.length !== 0) throw new Error("Cannot replace a non-main query context");
+	_ctx = new QueryContext();
+	return _ctx;
 }
 
 export function popContext(): void {

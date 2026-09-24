@@ -1225,6 +1225,562 @@ test("the owning manager's compact and tree events invalidate its warm resume an
 	expect(readFileSync(parent.path, "utf8")).not.toContain("parent history marker");
 });
 
+test("owner compaction retires a live SDK query and resumes only the compacted tool-result snapshot", async () => {
+	const owner = extension(manager("live-compact-owner"));
+	owner.fire("session_start");
+	const session = createSession({ projectPath: root, claudeDir: root });
+	const history: HostMessage[] = [];
+	for (let i = 0; i < 12; i++) {
+		session.addUserMessage(`discarded history ${i}`);
+		session.addAssistantMessage([{ type: "text", text: `old answer ${i}` }]);
+		history.push(u(`discarded history ${i}`), {
+			role: "assistant", content: [{ type: "text", text: `old answer ${i}` }], stopReason: "stop", timestamp: 1,
+		});
+	}
+	session.save();
+	const oldId = session.sessionId;
+	T.setSharedSession({ sessionId: oldId, cursor: history.length, cwd: root });
+	let warmStarts = 0;
+	startWarm = async () => {
+		warmStarts++;
+		return { query() { throw new Error("unexpected warm query"); }, close() {} };
+	};
+	const oldReady = new Deferred<undefined>();
+	let oldHandler: ToolHandler | undefined;
+	let oldResult: Promise<ToolResult> | undefined;
+	const oldFinished = new Deferred<undefined>();
+	runs.push(async function* ({ prompt, options }, query) {
+		try {
+			if (typeof prompt !== "string") await prompt[Symbol.asyncIterator]().next();
+			yield { type: "system", subtype: "init", session_id: oldId };
+			yield { type: "assistant", message: { content: [{ type: "tool_use", id: "old-tool", name: "mcp__custom-tools__echo", input: {} }] } };
+			oldHandler = options.mcpServers?.["custom-tools"]?.instance.tools[0]?.handler;
+			if (!oldHandler) throw new Error("missing old tool handler");
+			oldResult = oldHandler("old-tool");
+			oldReady.resolve(undefined);
+			await query.closed.promise;
+			yield { type: "stream_event", event: { type: "message_start", message: { usage: { input_tokens: 9000, output_tokens: 90 } } } };
+			yield { type: "result", subtype: "success", result: "stale SDK answer" };
+		} finally {
+			oldFinished.resolve(undefined);
+		}
+	});
+	const first = terminalEvent(T.streamClaudeAgentSdk(model, context([...history, u("original work")], [tool]), { cwd: root }));
+	await oldReady.promise;
+	await first.ended.promise;
+	owner.fire("session_compact", { fromExtension: false });
+
+	const freshReady = new Deferred<undefined>();
+	const nextTool = new Deferred<ToolResult>();
+	const freshPrompt: PromptMessage[] = [];
+	let imported: ImportedSession | null = null;
+	runs.push(async function* ({ prompt, options }, query) {
+		imported = importedSession(options.resume);
+		if (typeof prompt !== "string") freshPrompt.push((await prompt[Symbol.asyncIterator]().next()).value);
+		yield { type: "system", subtype: "init", session_id: options.resume };
+		yield { type: "assistant", message: { content: [{ type: "tool_use", id: "new-tool", name: "mcp__custom-tools__echo", input: {} }], usage: { input_tokens: 7, output_tokens: 3 } } };
+		const handler = options.mcpServers?.["custom-tools"]?.instance.tools[0]?.handler;
+		if (!handler) throw new Error("missing new tool handler");
+		void handler("new-tool").then((value) => nextTool.resolve(value));
+		freshReady.resolve(undefined);
+		const delivered = await Promise.race([nextTool.promise, query.closed.promise]);
+		if (!delivered) return;
+		if (delivered.content[0]?.text !== "next tool answer") throw new Error("incorrect next-round tool result");
+		yield { type: "assistant", message: { content: [{ type: "text", text: "continued original work" }], usage: { input_tokens: 7, output_tokens: 3 } } };
+		yield { type: "result", subtype: "success", result: "continued original work" };
+	});
+	const compacted = context([
+		u("compact summary: continue the original work"), a("old-tool"), result("old-tool", "exact imported result"),
+		d("pending developer instruction"), u("pending user instruction"),
+	], [tool]);
+	const resumed = terminalEvent(T.streamClaudeAgentSdk(model, compacted, { cwd: root }));
+	expect(queryCalls).toHaveLength(2);
+	await freshReady.promise;
+	await resumed.ended.promise;
+	const newId = queryCalls[1]?.options.resume;
+	expect(newId).toMatch(/^[0-9a-f]{8}-[0-9a-f-]{27}$/i);
+	expect(newId).not.toBe(oldId);
+	const snapshot = JSON.stringify(requireImported(imported).content);
+	expect(snapshot).toContain("compact summary: continue the original work");
+	expect(snapshot).toContain("exact imported result");
+	expect(snapshot).not.toContain("discarded history");
+	expect(snapshot).not.toContain("pending developer instruction");
+	const prompt = freshPrompt.map(promptText).join("\n");
+	expect(prompt).toContain(`${DEVELOPER_OPEN}pending developer instruction${DEVELOPER_CLOSE}`);
+	expect(prompt).toContain("pending user instruction");
+	expect(prompt).not.toContain("[continue]");
+	expect(resumed.events.at(-1)).toMatchObject({ type: "done", reason: "toolUse", message: { usage: { input: 7, output: 3 } } });
+	expect(resumed.events.some((event) => JSON.stringify(event).includes("new-tool"))).toBe(true);
+	const replay = terminalEvent(T.streamClaudeAgentSdk(model, compacted, { cwd: root }));
+	await replay.ended.promise;
+	expect(queryCalls).toHaveLength(2);
+	expect(T.getMainQueryContext().activeQuery).toBe(queries[1]);
+	const retired = await oldResult;
+	expect(retired?.isError).toBe(true);
+	expect(JSON.stringify(retired)).not.toContain("exact imported result");
+	await oldFinished.promise;
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	expect(warmStarts).toBe(0);
+	expect(T.getSharedSession()?.sessionId).toBe(newId);
+	expect(T.getSharedSession()?.cursor).toBeLessThanOrEqual(compacted.messages.length);
+	expect(resumed.events.some((event) => JSON.stringify(event).includes("stale SDK answer"))).toBe(false);
+	const beforeLateWrite = readFileSync(requireImported(imported).path, "utf8");
+	writeFileSync(session.jsonlPath, "\nlate SDK append on retired path", { flag: "a" });
+	expect(readFileSync(requireImported(imported).path, "utf8")).toBe(beforeLateWrite);
+
+	const secondRound = context([
+		...compacted.messages, a("new-tool"), result("new-tool", "next tool answer"),
+	], [tool]);
+	const final = terminalEvent(T.streamClaudeAgentSdk(model, secondRound, { cwd: root }));
+	await final.ended.promise;
+	expect(final.events.some((event) => JSON.stringify(event).includes("continued original work"))).toBe(true);
+	expect(final.events.at(-1)).toMatchObject({ type: "done", message: { usage: { input: 7, output: 3 } } });
+	await expect(nextTool.promise).resolves.toMatchObject({ content: [{ text: "next tool answer" }] });
+	expect(T.getSharedSession()).toMatchObject({ sessionId: newId });
+	const lateHandler = await oldHandler!("old-tool");
+	expect(lateHandler.isError).toBe(true);
+	expect(JSON.stringify(lateHandler)).not.toContain("next tool answer");
+	const duplicate = terminalEvent(T.streamClaudeAgentSdk(model, secondRound, { cwd: root }));
+	await duplicate.ended.promise;
+	expect(queryCalls).toHaveLength(2);
+	expect(T.getSharedSession()).toMatchObject({ sessionId: newId });
+});
+
+test("first live SDK query without a published session rotates after owner compaction, not child lifecycle", async () => {
+	const owner = extension(manager("first-query-owner"));
+	owner.fire("session_start");
+	const oldId = "22222222-2222-4222-8222-222222222222";
+	const started = new Deferred<undefined>();
+	let pending: Promise<ToolResult> | undefined;
+	runs.push(async function* ({ prompt, options }, query) {
+		if (typeof prompt !== "string") await prompt[Symbol.asyncIterator]().next();
+		yield { type: "system", subtype: "init", session_id: oldId };
+		yield { type: "assistant", message: { content: [{ type: "tool_use", id: "first-tool", name: "mcp__custom-tools__echo", input: {} }] } };
+		const handler = options.mcpServers?.["custom-tools"]?.instance.tools[0]?.handler;
+		if (!handler) throw new Error("missing first-query handler");
+		pending = handler("first-tool");
+		started.resolve(undefined);
+		await query.closed.promise;
+		yield { type: "result", subtype: "success", result: "obsolete first-query answer" };
+	});
+	const first = terminalEvent(T.streamClaudeAgentSdk(model, context([u("original first-query job")], [tool]), { cwd: root }));
+	await started.promise;
+	await first.ended.promise;
+	expect(queryCalls[0]?.options.resume).toBeUndefined();
+	expect(T.getSharedSession()).toBeNull();
+	const child = extension(manager("other-manager"));
+	child.fire("session_start");
+	child.fire("session_compact", { fromExtension: false });
+	child.fire("session_shutdown");
+	expect(T.getMainQueryContext().activeQuery).toBe(queries[0]);
+	expect(queryCalls).toHaveLength(1);
+	owner.fire("session_compact", { fromExtension: false });
+
+	const prompts: PromptMessage[] = [];
+	let imported: ImportedSession | null = null;
+	runs.push(async function* ({ prompt, options }) {
+		imported = importedSession(options.resume);
+		if (typeof prompt !== "string") prompts.push((await prompt[Symbol.asyncIterator]().next()).value);
+		yield { type: "system", subtype: "init", session_id: options.resume };
+		yield { type: "result", subtype: "success", result: "first-query work continued" };
+	});
+	const resumed = terminalEvent(T.streamClaudeAgentSdk(model, context([
+		u("summary retaining the original first-query job"), a("first-tool"),
+		result("first-tool", "first imported result"), d("fresh instruction"),
+	], [tool]), { cwd: root }));
+	expect(queryCalls).toHaveLength(2);
+	await resumed.ended.promise;
+	expect(queryCalls[1]?.options.resume).not.toBe(oldId);
+	expect(JSON.stringify(requireImported(imported).content)).toContain("first imported result");
+	expect(promptText(prompts[0]!)).toContain(`${DEVELOPER_OPEN}fresh instruction${DEVELOPER_CLOSE}`);
+	expect(promptText(prompts[0]!)).not.toContain("[continue]");
+	expect(resumed.events.some((event) => JSON.stringify(event).includes("first-query work continued"))).toBe(true);
+	expect(resumed.events.some((event) => JSON.stringify(event).includes("obsolete first-query answer"))).toBe(false);
+	expect((await pending)?.isError).toBe(true);
+	expect(T.getSharedSession()?.sessionId).toBe(queryCalls[1]?.options.resume);
+});
+test("owner compact event overrides equal-length history and the first tool callback cursor", async () => {
+	const owner = extension(manager("equal-length-compact-owner"));
+	owner.fire("session_start");
+	const session = createSession({ projectPath: root, claudeDir: root });
+	session.addUserMessage("obsolete turn");
+	session.addAssistantMessage([{ type: "text", text: "obsolete answer" }]);
+	session.save();
+	T.setSharedSession({ sessionId: session.sessionId, cursor: 2, cwd: root });
+	const started = new Deferred<undefined>();
+	let pending: Promise<ToolResult> | undefined;
+	runs.push(async function* ({ prompt, options }, query) {
+		if (typeof prompt !== "string") await prompt[Symbol.asyncIterator]().next();
+		yield { type: "system", subtype: "init", session_id: session.sessionId };
+		yield { type: "assistant", message: { content: [{ type: "tool_use", id: "same-count", name: "mcp__custom-tools__echo", input: {} }] } };
+		const handler = options.mcpServers?.["custom-tools"]?.instance.tools[0]?.handler;
+		if (!handler) throw new Error("missing equal-length handler");
+		pending = handler("same-count");
+		started.resolve(undefined);
+		await query.closed.promise;
+	});
+	const original = context([u("obsolete turn"), earlierAnswer, u("original task"), d("original instruction")], [tool]);
+	const first = terminalEvent(T.streamClaudeAgentSdk(model, original, { cwd: root }));
+	await started.promise;
+	await first.ended.promise;
+	owner.fire("session_compact", { fromExtension: false });
+	const prompts: PromptMessage[] = [];
+	let imported: ImportedSession | null = null;
+	runs.push(async function* ({ prompt, options }) {
+		imported = importedSession(options.resume);
+		if (typeof prompt !== "string") prompts.push((await prompt[Symbol.asyncIterator]().next()).value);
+		yield { type: "system", subtype: "init", session_id: options.resume };
+		yield { type: "result", subtype: "success", result: "same-count work resumed" };
+	});
+	const compacted = context([
+		u("new summary of original task"), a("same-count"), result("same-count", "exact result"),
+		d("new instruction"),
+	], [tool]);
+	expect(compacted.messages).toHaveLength(original.messages.length);
+	const resumed = terminalEvent(T.streamClaudeAgentSdk(model, compacted, { cwd: root }));
+	expect(queryCalls).toHaveLength(2);
+	await resumed.ended.promise;
+	expect(queryCalls[1]?.options.resume).not.toBe(session.sessionId);
+	expect(JSON.stringify(requireImported(imported).content)).toContain("exact result");
+	expect(JSON.stringify(requireImported(imported).content)).not.toContain("obsolete turn");
+	expect(promptText(prompts[0]!)).toContain("new instruction");
+	expect(promptText(prompts[0]!)).not.toContain("original instruction");
+	expect((await pending)?.isError).toBe(true);
+	expect(resumed.events.at(-1)).toMatchObject({ type: "done", message: { content: [{ text: "same-count work resumed" }] } });
+});
+
+
+test("owner compaction resumes tool-only callback with an explicit continuation prompt", async () => {
+	const owner = extension(manager("tool-only-compact-owner"));
+	owner.fire("session_start");
+	const oldReady = new Deferred<undefined>();
+	const oldId = "55555555-5555-4555-8555-555555555555";
+	let oldResult: Promise<ToolResult> | undefined;
+	runs.push(async function* ({ prompt, options }, query) {
+		if (typeof prompt !== "string") await prompt[Symbol.asyncIterator]().next();
+		yield { type: "system", subtype: "init", session_id: oldId };
+		yield { type: "assistant", message: { content: [{ type: "tool_use", id: "tool-only", name: "mcp__custom-tools__echo", input: {} }] } };
+		const handler = options.mcpServers?.["custom-tools"]?.instance.tools[0]?.handler;
+		if (!handler) throw new Error("missing old tool handler");
+		oldResult = handler("tool-only");
+		oldReady.resolve(undefined);
+		await query.closed.promise;
+		throw new Error("stale old SDK failure");
+	});
+	const first = terminalEvent(T.streamClaudeAgentSdk(model, context([u("solve the original task")], [tool]), { cwd: root }));
+	await oldReady.promise;
+	await first.ended.promise;
+	owner.fire("session_compact", { fromExtension: false });
+	const prompts: PromptMessage[] = [];
+	let imported: ImportedSession | null = null;
+	runs.push(async function* ({ prompt, options }) {
+		imported = importedSession(options.resume);
+		if (typeof prompt !== "string") prompts.push((await prompt[Symbol.asyncIterator]().next()).value);
+		yield { type: "system", subtype: "init", session_id: options.resume };
+		yield { type: "assistant", message: { content: [{ type: "text", text: "solved original task" }], usage: { input_tokens: 4, output_tokens: 2 } } };
+		yield { type: "result", subtype: "success", result: "solved original task" };
+	});
+	const compacted = context([
+		u("summary: solve the original task"), a("tool-only"), result("tool-only", "exact tool-only output"),
+	], [tool]);
+	const resumed = terminalEvent(T.streamClaudeAgentSdk(model, compacted, { cwd: root }));
+	expect(queryCalls).toHaveLength(2);
+	await resumed.ended.promise;
+	expect(queryCalls[1]?.options.resume).not.toBe(oldId);
+	const snapshot = JSON.stringify(requireImported(imported).content);
+	expect(snapshot).toContain("summary: solve the original task");
+	expect(snapshot).toContain("exact tool-only output");
+	expect(prompts).toHaveLength(1);
+	expect(promptText(prompts[0]!)).toMatch(/\bcontinu\w*\b/i);
+	expect(promptText(prompts[0]!)).not.toContain("[continue]");
+	expect(promptText(prompts[0]!)).not.toContain("exact tool-only output");
+	expect(resumed.events).toContainEqual(expect.objectContaining({ type: "text_delta", delta: "solved original task" }));
+	expect(resumed.events.at(-1)).toMatchObject({ type: "done", reason: "stop", message: { usage: { input: 4, output: 2 } } });
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	expect(resumed.events.some((event) => JSON.stringify(event).includes("stale old SDK failure"))).toBe(false);
+	expect(T.getSharedSession()?.sessionId).toBe(queryCalls[1]?.options.resume);
+	expect((await oldResult)?.isError).toBe(true);
+});
+
+test("aborted compacted tool callback never starts a replacement SDK query", async () => {
+	const owner = extension(manager("aborted-compact-owner"));
+	owner.fire("session_start");
+	const started = new Deferred<undefined>();
+	runs.push(async function* ({ prompt }, query) {
+		if (typeof prompt !== "string") await prompt[Symbol.asyncIterator]().next();
+		yield { type: "system", subtype: "init", session_id: "33333333-3333-4333-8333-333333333333" };
+		yield { type: "assistant", message: { content: [{ type: "tool_use", id: "abort-tool", name: "mcp__custom-tools__echo", input: {} }] } };
+		started.resolve(undefined);
+		await query.closed.promise;
+	});
+	const first = terminalEvent(T.streamClaudeAgentSdk(model, context([u("work")], [tool]), { cwd: root }));
+	await started.promise;
+	await first.ended.promise;
+	owner.fire("session_compact", { fromExtension: false });
+	const abort = new AbortController();
+	abort.abort();
+	const callback = terminalEvent(T.streamClaudeAgentSdk(model, context([
+		u("summary"), a("abort-tool"), result("abort-tool", "aborted result"), d("pending instruction"),
+	], [tool]), { cwd: root, signal: abort.signal }));
+	let callbackEnded = false;
+	void callback.ended.promise.then(() => { callbackEnded = true; });
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	try {
+		expect(queryCalls).toHaveLength(1);
+		expect(callbackEnded).toBe(true);
+		expect(callback.events.at(-1)).toMatchObject({ type: "done", reason: "stop" });
+	} finally {
+		queries[0]!.close();
+	}
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	const prompts: PromptMessage[] = [];
+	runs.push(successRun(prompts, "66666666-6666-4666-8666-666666666666"));
+	const next = terminalEvent(T.streamClaudeAgentSdk(model, context([
+		u("compact summary of previous task"), a("abort-tool"), result("abort-tool", "aborted result"),
+		u("new real user request"),
+	], [tool]), { cwd: root }));
+	expect(queryCalls).toHaveLength(2);
+	let nextEnded = false;
+	void next.ended.promise.then(() => { nextEnded = true; });
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	expect(nextEnded).toBe(true);
+	expect(promptText(prompts[0]!)).toContain("new real user request");
+	expect(next.events).toContainEqual(expect.objectContaining({ type: "text_delta", delta: "finished" }));
+	expect(next.events.at(-1)).toMatchObject({ type: "done", reason: "stop" });
+});
+
+for (const compactFirst of [true, false]) {
+	test(`compaction and abort (${compactFirst ? "compact before abort" : "abort before compact"}) do not steer the next independent user turn`, async () => {
+		const owner = extension(manager("abort-after-compact-owner"));
+		owner.fire("session_start");
+		const parent = parentSession();
+		const abort = new AbortController();
+		const started = new Deferred<undefined>();
+		runs.push(async function* ({ prompt, options }, query) {
+			if (typeof prompt !== "string") await prompt[Symbol.asyncIterator]().next();
+			yield { type: "system", subtype: "init", session_id: parent.shared.sessionId };
+			yield { type: "assistant", message: { content: [{ type: "tool_use", id: "aborted-after-compact", name: "mcp__custom-tools__echo", input: {} }] } };
+			const handler = options.mcpServers?.["custom-tools"]?.instance.tools[0]?.handler;
+			if (!handler) throw new Error("missing abort tool handler");
+			void handler("aborted-after-compact");
+			started.resolve(undefined);
+			await query.closed.promise;
+			yield { type: "result", subtype: "success", result: "outdated aborted answer" };
+		});
+		const old = terminalEvent(T.streamClaudeAgentSdk(model, context([
+			u("parent history marker"),
+			{ role: "assistant", content: [{ type: "text", text: "parent answered earlier" }], stopReason: "stop", timestamp: 1 },
+			u("aborted original task"),
+		], [tool]), { cwd: root, signal: abort.signal }));
+		await started.promise;
+		await old.ended.promise;
+		if (compactFirst) {
+			owner.fire("session_compact", { fromExtension: false });
+			abort.abort();
+		} else {
+			abort.abort();
+			owner.fire("session_compact", { fromExtension: false });
+		}
+		await queries[0]!.closed.promise;
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		expect(T.getMainQueryContext().activeQuery).toBeNull();
+		const prompts: PromptMessage[] = [];
+		runs.push(successRun(prompts, "99999999-9999-4999-8999-999999999999"));
+		const fresh = terminalEvent(T.streamClaudeAgentSdk(model, context([
+			u("compacted summary of aborted task"), a("aborted-after-compact"),
+			result("aborted-after-compact", "orphaned old result"), u("independent new user request"),
+		], [tool]), { cwd: root }));
+		expect(queryCalls).toHaveLength(2);
+		let finished = false;
+		void fresh.ended.promise.then(() => { finished = true; });
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		expect(finished).toBe(true);
+		expect(prompts.map(promptText)).toEqual(["independent new user request"]);
+		expect(fresh.events).toContainEqual(expect.objectContaining({ type: "text_delta", delta: "finished" }));
+		expect(fresh.events.at(-1)).toMatchObject({ type: "done", reason: "stop" });
+	});
+}
+
+test("first-query compact survives its finalizer and does not retire the next query's tool callback", async () => {
+	const owner = extension(manager("finished-first-compact-owner"));
+	owner.fire("session_start");
+	const originalId = "77777777-7777-4777-8777-777777777777";
+	const started = new Deferred<undefined>();
+	const finish = new Deferred<undefined>();
+	let warmStarts = 0;
+	startWarm = async () => {
+		warmStarts++;
+		return { query() { throw new Error("unexpected prewarm"); }, close() {} };
+	};
+	runs.push(async function* ({ prompt }) {
+		if (typeof prompt !== "string") await prompt[Symbol.asyncIterator]().next();
+		yield { type: "system", subtype: "init", session_id: originalId };
+		started.resolve(undefined);
+		await finish.promise;
+		yield { type: "result", subtype: "success", result: "old precompact answer" };
+	});
+	const first = terminalEvent(T.streamClaudeAgentSdk(model, context([u("obsolete first-query task")], [tool]), { cwd: root }));
+	await started.promise;
+	expect(T.getSharedSession()).toBeNull();
+	owner.fire("session_compact", { fromExtension: false });
+	finish.resolve(undefined);
+	await first.ended.promise;
+	await queries[0]!.closed.promise;
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	expect(T.getSharedSession()).toMatchObject({ sessionId: originalId, needsRebuild: true });
+	expect(warmStarts).toBe(0);
+
+	let imported: ImportedSession | null = null;
+	const secondReady = new Deferred<undefined>();
+	runs.push(async function* ({ prompt, options }, query) {
+		imported = importedSession(options.resume);
+		if (typeof prompt !== "string") await prompt[Symbol.asyncIterator]().next();
+		yield { type: "system", subtype: "init", session_id: options.resume };
+		yield { type: "assistant", message: { content: [{ type: "tool_use", id: "fresh-tool", name: "mcp__custom-tools__echo", input: {} }] } };
+		const handler = options.mcpServers?.["custom-tools"]?.instance.tools[0]?.handler;
+		if (!handler) throw new Error("missing fresh tool handler");
+		const answer = handler("fresh-tool");
+		secondReady.resolve(undefined);
+		const delivered = await Promise.race([answer, query.closed.promise]);
+		if (!delivered) return;
+		if (delivered.content[0]?.text !== "fresh tool answer") throw new Error("wrong fresh tool result");
+		yield { type: "result", subtype: "success", result: "fresh task completed" };
+	});
+	const current = context([u("new compact summary"), earlierAnswer, u("next main task")], [tool]);
+	const second = terminalEvent(T.streamClaudeAgentSdk(model, current, { cwd: root }));
+	await secondReady.promise;
+	await second.ended.promise;
+	const snapshot = JSON.stringify(requireImported(imported).content);
+	expect(snapshot).toContain("new compact summary");
+	expect(snapshot).not.toContain("obsolete first-query task");
+	const callback = terminalEvent(T.streamClaudeAgentSdk(model, context([
+		...current.messages, a("fresh-tool"), result("fresh-tool", "fresh tool answer"),
+	], [tool]), { cwd: root }));
+	expect(queryCalls).toHaveLength(2);
+	let callbackEnded = false;
+	void callback.ended.promise.then(() => { callbackEnded = true; });
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	expect(callbackEnded).toBe(true);
+	expect(callback.events).toContainEqual(expect.objectContaining({ type: "text_delta", delta: "fresh task completed" }));
+	expect(callback.events.at(-1)).toMatchObject({ type: "done", reason: "stop" });
+	expect(queryCalls).toHaveLength(2);
+});
+
+test("prior query finalizer cannot unregister the next live query's compact retirement", async () => {
+	const owner = extension(manager("overlapping-compact-owner"));
+	owner.fire("session_start");
+	const parent = parentSession();
+	const history = [
+		u("parent history marker"),
+		{ role: "assistant", content: [{ type: "text", text: "parent answered earlier" }], stopReason: "stop", timestamp: 1 },
+	];
+	runs.push(successRun([], parent.shared.sessionId));
+	const first = terminalEvent(T.streamClaudeAgentSdk(model, context([...history, u("first main request")], [tool]), { cwd: root }));
+	await first.ended.promise;
+	// The first stream ends in its .then(); its .finally() has not yet had a
+	// chance to run. Register the next main query before crossing that boundary.
+	const secondReady = new Deferred<undefined>();
+	let parked: Promise<ToolResult> | undefined;
+	runs.push(async function* ({ prompt, options }, query) {
+		if (typeof prompt !== "string") await prompt[Symbol.asyncIterator]().next();
+		yield { type: "system", subtype: "init", session_id: parent.shared.sessionId };
+		yield { type: "assistant", message: { content: [{ type: "tool_use", id: "overlap-tool", name: "mcp__custom-tools__echo", input: {} }] } };
+		const handler = options.mcpServers?.["custom-tools"]?.instance.tools[0]?.handler;
+		if (!handler) throw new Error("missing overlapping tool handler");
+		parked = handler("overlap-tool");
+		secondReady.resolve(undefined);
+		await query.closed.promise;
+	});
+	const second = terminalEvent(T.streamClaudeAgentSdk(model, context([
+		...history, u("first main request"),
+		{ role: "assistant", content: [{ type: "text", text: "finished" }], stopReason: "stop", timestamp: 1 },
+		u("second main request"),
+	], [tool]), { cwd: root }));
+	await secondReady.promise;
+	await second.ended.promise;
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	owner.fire("session_compact", { fromExtension: false });
+	const prompts: PromptMessage[] = [];
+	runs.push(async function* ({ prompt, options }) {
+		if (typeof prompt !== "string") prompts.push((await prompt[Symbol.asyncIterator]().next()).value);
+		yield { type: "system", subtype: "init", session_id: options.resume };
+		yield { type: "result", subtype: "success", result: "replacement after overlap" };
+	});
+	const resumed = terminalEvent(T.streamClaudeAgentSdk(model, context([
+		u("compact summary after two main requests"), a("overlap-tool"),
+		result("overlap-tool", "overlap result"), d("pending overlap instruction"),
+	], [tool]), { cwd: root }));
+	expect(queryCalls).toHaveLength(3);
+	await resumed.ended.promise;
+	expect(queryCalls[2]?.options.resume).not.toBe(parent.shared.sessionId);
+	expect(promptText(prompts[0]!)).toContain("pending overlap instruction");
+	expect(resumed.events).toContainEqual(expect.objectContaining({ type: "text_delta", delta: "replacement after overlap" }));
+	expect((await parked)?.isError).toBe(true);
+});
+
+test("a critical handoff steered before compaction is not repeated in the replacement prompt", async () => {
+	const owner = extension(manager("handoff-compact-owner"));
+	owner.fire("session_start");
+	const firstToolReady = new Deferred<undefined>();
+	const nextToolReady = new Deferred<undefined>();
+	const oldPrompts: PromptMessage[] = [];
+	let parked: Promise<ToolResult> | undefined;
+	runs.push(async function* ({ prompt, options }, query) {
+		if (typeof prompt === "string") throw new Error("expected SDK input stream");
+		const input = prompt[Symbol.asyncIterator]();
+		oldPrompts.push((await input.next()).value);
+		yield { type: "system", subtype: "init", session_id: "44444444-4444-4444-8444-444444444444" };
+		yield { type: "assistant", message: { content: [{ type: "tool_use", id: "handoff-tool", name: "mcp__custom-tools__echo", input: {} }] } };
+		const handler = options.mcpServers?.["custom-tools"]?.instance.tools[0]?.handler;
+		if (!handler) throw new Error("missing old tool handler");
+		const firstResult = handler("handoff-tool");
+		firstToolReady.resolve(undefined);
+		const steer = await Promise.race([
+			input.next().catch(() => ({ done: true as const, value: undefined })),
+			query.closed.promise.then(() => ({ done: true as const, value: undefined })),
+		]);
+		if (steer.done) return;
+		oldPrompts.push(steer.value);
+		void input.next().catch(() => {});
+		if ((await firstResult).content[0]?.text !== "handoff tool output") throw new Error("handoff result lost");
+		yield { type: "assistant", message: { content: [{ type: "tool_use", id: "late-tool", name: "mcp__custom-tools__echo", input: {} }] } };
+		parked = handler("late-tool");
+		nextToolReady.resolve(undefined);
+		await query.closed.promise;
+		yield { type: "result", subtype: "success", result: "obsolete handoff response" };
+	});
+	const first = terminalEvent(T.streamClaudeAgentSdk(model, context([u("finish original task")], [tool]), { cwd: root }));
+	await firstToolReady.promise;
+	await first.ended.promise;
+	const handoff = terminalEvent(T.streamClaudeAgentSdk(model, context([
+		u("finish original task"), a("handoff-tool"),
+		d("<critical>handoff marker: continue original task</critical>"), result("handoff-tool", "handoff tool output"),
+	], [tool]), { cwd: root }));
+	await nextToolReady.promise;
+	await handoff.ended.promise;
+	expect(oldPrompts.map(promptText).join("\n")).toContain("<critical>handoff marker: continue original task</critical>");
+	owner.fire("session_compact", { fromExtension: false });
+	const newPrompts: PromptMessage[] = [];
+	runs.push(async function* ({ prompt, options }) {
+		if (typeof prompt !== "string") newPrompts.push((await prompt[Symbol.asyncIterator]().next()).value);
+		yield { type: "system", subtype: "init", session_id: options.resume };
+		yield { type: "result", subtype: "success", result: "original task completed" };
+	});
+	const resumed = terminalEvent(T.streamClaudeAgentSdk(model, context([
+		u("summary: finish original task"), a("late-tool"), result("late-tool", "second imported output"),
+		d("new instruction after compact"),
+	], [tool]), { cwd: root }));
+	expect(queryCalls).toHaveLength(2);
+	await resumed.ended.promise;
+	const prompt = newPrompts.map(promptText).join("\n");
+	expect(prompt).toContain("new instruction after compact");
+	expect(prompt).not.toContain("<critical>handoff marker");
+	expect(prompt).not.toContain("[continue]");
+	expect((await parked)?.isError).toBe(true);
+	expect(resumed.events.some((event) => JSON.stringify(event).includes("original task completed"))).toBe(true);
+	expect(resumed.events.some((event) => JSON.stringify(event).includes("obsolete handoff response"))).toBe(false);
+});
+
 test("owner identity persists across session switches but its new session and branch cannot resume stale history", async () => {
 	const ownManager = manager("first-owner-session");
 	const owner = extension(ownManager);

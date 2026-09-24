@@ -16,12 +16,16 @@ bun test tests/*.test.ts
 | `usage.test.ts` | Quota from SDK rate-limit events: `unifiedWindows` fractions, the documented percentage fallback, stale windows, values on an unknown scale |
 | `claude-models.test.ts` | Collapsing Claude Code's picker entries into base model ids and 1M capability |
 | `developer-input.test.ts` | Developer markers, multiple pending inputs, interleaved results, lossless images and rebuilt tool pairing |
-| `developer-routing.test.ts` | Real provider routing with simulated SDK `query`/`startup`: developer input during MCP execution, write-ack ordering, duplicate callbacks, orphans, aborts, prewarm reuse and AskClaude history; child/side-history replay and parent isolation; private-file cleanup on completion without init, iterator/startup errors and aborts; lifecycle ownership and late shutdown finalizers |
+| `developer-routing.test.ts` | Real provider routing with simulated SDK `query`/`startup`: developer input during MCP execution, write-ack ordering, duplicate callbacks, orphans, aborts, prewarm reuse and AskClaude history; child/side-history replay and parent isolation; private-file cleanup on completion without init, iterator/startup errors and aborts; lifecycle ownership and late shutdown finalizers; live main-query `session_compact` handoff at tool results, retired-query races, retained JSONL and subsequent tool rounds |
 
 The routing fixture runs the production provider and MCP routing closures, not helper-only
 approximations. It replaces SDK transport and the host event sink, so it exercises no live
 Claude Code process. Session files and diagnostics stay in temporary directories inside
-the repository, removed after each test file.
+the repository, removed after each test file. Mid-turn cases check that the old main
+query is retired, its pending MCP handlers settle, discarded history is absent from
+the replacement session JSONL, actual tool results and pending input survive, late
+output/finalizers cannot reclaim ownership, and another tool round can run. Usage
+assertions use simulated SDK values, not measured quota or prompt-cache behavior.
 
 The side-request regressions pass omp's `<session>:side:…` metadata through the actual provider.
 They cover a shortened idle recap, a main turn overlapping the recap, copied parent tool results,

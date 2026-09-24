@@ -71,6 +71,11 @@ Upstream's omp port has not been updated since July 2026, so the fixes below liv
   at 30 seconds — not enough for a real context, and a discarded takeover left the session
   uncompacted. Declining hands the summary to omp's normal provider path, which has no deadline.
   Still available with `provider.compactTakeover: true`.
+- **Mid-turn compaction hands off the main query.** When omp compacts during
+  tools, the bridge starts a fresh Claude Code session from omp's retained
+  summary and actual tool results rather than continuing against the old
+  transcript. Child and side requests are unaffected; see
+  [Mid-turn compaction](#mid-turn-compaction).
 - **The next Claude Code process is pre-warmed** between turns (measured: ~1.5 s less per message).
 - **Claude subscription quota reaches omp** (the status bar, `retry.usageAwareFallback`), built from
   the rate-limit events the SDK reports during a turn — no credential is read (see below).
@@ -353,6 +358,29 @@ from rebuilding the main transcript; it does not guarantee a prompt-cache hit or
 To stop idle recap requests entirely, optionally set `recap.enabled: false` in **omp's settings**
 (not `claude-bridge.json`). The fix does not change that setting or the idle interval.
 
+
+### Mid-turn compaction
+
+In omp 18.2.11, `session_compact` can replace the main conversation while an
+SDK query is waiting for tool results. On the matching result callback, the
+bridge retires that query, closes its pending MCP handlers and imports omp's
+retained compacted context and real tool results into a new Claude Code session.
+With no new user message after the tools, a short continuation prompt asks for
+the **original unfinished work**, not another summary; any pending user or
+harness input is forwarded too. Late output from the old query cannot change
+the new session. Only the owned main query is handed off; child and side turns
+keep their separate routing.
+
+The new session uses a new UUID rather than rewriting JSONL while the retired
+SDK query could still write to it; ordinary idle compaction keeps its existing
+UUID. Dropped history is not reimported, but the changed cache prefix can
+require a new cache write. This is not a promise of lower billed tokens or
+prompt-cache hits; usage remains the SDK's reported usage. The provider path
+has been exercised with a simulated SDK and actual session JSONL, **not** a
+live Claude Code request or measured subscription quota/cache behavior.
+After updating and reloading the bridge, you may optionally re-enable
+`compaction.midTurnEnabled: true` in **omp's settings** if you had disabled it.
+The bridge does not modify that setting for you.
 
 ## Debugging
 

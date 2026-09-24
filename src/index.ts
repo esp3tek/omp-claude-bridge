@@ -12,12 +12,12 @@ import { createSession, deleteSession, repairToolPairing } from "cc-session-io";
 import { appendFileSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from "fs";
 import { homedir } from "os";
 import { dirname, join } from "path";
-import { PROVIDER_ID, messageContentToText, convertPiMessages, importMessagesLossless, splitPendingInput } from "./convert.js";
+import { PROVIDER_ID, messageContentToText, convertPiMessages, importMessagesLossless, promptMessageBlocks, splitPendingInput, type PendingInput } from "./convert.js";
 import { buildVariantModels, buildModels, STATIC_FALLBACK_IDS, claudeCodeModelId, type ContextWindowMode, type LongContextSettings, resolveModel as _resolveModel } from "./models.js";
 import { MCP_SERVER_NAME, MCP_TOOL_PREFIX, extractSkillsBlock } from "./skills.js";
 import { verifyWrittenSession as _verifyWrittenSession } from "./session-verify.js";
 import { extractAllToolResults as _extractAllToolResults, type McpResult } from "./extract-tool-results.js";
-import { QueryContext, ctx } from "./query-state.js";
+import { QueryContext, ctx, replaceMainContext } from "./query-state.js";
 import { loadConfig, type Config } from "./config.js";
 import { extractAgentsAppend } from "./agents-md.js";
 import { buildActionSummary, type ToolCallState } from "./askclaude-ui.js";
@@ -247,14 +247,8 @@ interface SessionState {
 	// navigation) or after an abort left the JSONL in an indeterminate state.
 	// REBUILD wipes and rewrites the file to match pi's current history.
 	needsRebuild?: boolean;
-	// Set ONLY after an abort. The killed CC subprocess may still be flushing
-	// a late "[Request interrupted by user]" record to the session JSONL.
-	// Reusing the same sessionId/path would race that orphan write into our
-	// fresh file and break CC's parent-uuid chain on the next resume. When
-	// this flag is set, REBUILD takes a fresh UUID and skips deleteSession
-	// so the orphan writes land on a dead inode. Compact/tree do NOT set
-	// this — there's no concurrent CC writer during those events, so
-	// in-place rebuild (preserve UUID, deleteSession + createSession) is safe.
+	// A closed live query can still write the old JSONL. Abort and midturn
+	// compaction rotate to a fresh UUID; idle compaction/tree rebuild in place.
 	forceRotate?: boolean;
 }
 
@@ -629,9 +623,9 @@ function syncSharedSession(
 	isIsolated = false,
 	forceRebuild = false,
 ): SyncResult {
-	// Input interleaved with tool results: the results go into history and the
-	// input after them, which a count-based resume cannot express.
-	if (forceRebuild) debug(`syncSharedSession: pending input interleaved with tool results, rebuilding`);
+	// Compaction or interleaved input must rebuild even when the new history has
+	// the same cardinality as the old session's cursor.
+	if (forceRebuild) debug("syncSharedSession: explicitly rebuilding rewritten history");
 
 	// Decide child ownership before REUSE can hand it the parent's session.
 	// A live query retains context across tools, but an unexpected-stop reminder
@@ -737,10 +731,10 @@ function syncSharedSession(
 			: missedCount < 0 ? `drift, ${-missedCount} shorter than cursor` : `${missedCount} missed messages`;
 		debug(`Case 4: ${reason}, ${priorMessages.length} total → rewrote session ${session.sessionId.slice(0, 8)} (same id), ${session.messages.length} records`);
 	} else {
-		debug(`Case 4 post-abort: ${priorMessages.length} total → new session ${session.sessionId.slice(0, 8)} (was ${previousSessionId.slice(0, 8)}, rotated to avoid race with orphan writer), ${session.messages.length} records`);
+		debug(`Case 4 rotated: ${priorMessages.length} total → new session ${session.sessionId.slice(0, 8)} (was ${previousSessionId.slice(0, 8)}, avoiding orphan writer), ${session.messages.length} records`);
 	}
 	debugSessionPaths(`${session.sessionId.slice(0, 8)}`, cwd, session.jsonlPath);
-	debug(`syncResult: path=rebuild sessionId=${session.sessionId} priors=${priorMessages.length} ${previousSessionId === undefined ? "first" : preserveId ? "preserved" : "rotated-post-abort"}`);
+	debug(`syncResult: path=rebuild sessionId=${session.sessionId} priors=${priorMessages.length} ${previousSessionId === undefined ? "first" : preserveId ? "preserved" : "rotated"}`);
 	return { sessionId: session.sessionId };
 }
 
@@ -840,11 +834,14 @@ function contextForToolResults(results: McpResult[]): QueryContext | undefined {
 		const id = result.toolCallId;
 		if (!id) continue;
 		for (const queryCtx of activeQueryContexts) {
-			if (!queryCtx.activeQuery) continue;
-			if (queryCtx.pendingToolCalls.has(id) || queryCtx.pendingResults.has(id) || queryCtx.turnToolCallIds.includes(id)) {
+			if (queryCtx.retired || (!queryCtx.activeQuery && !queryCtx.compactionPending)) continue;
+			if (queryCtx.pendingToolCalls.has(id) || queryCtx.pendingResults.has(id) || queryCtx.turnToolCallIds.includes(id) || queryCtx.deliveredResultIds.has(id)) {
 				return queryCtx;
 			}
 		}
+		const main = ctx();
+		if (main.compactionPending && !main.retired && main.ownsSharedSession
+			&& (main.turnToolCallIds.includes(id) || main.deliveredResultIds.has(id) || main.pendingToolCalls.has(id))) return main;
 	}
 	return undefined;
 }
@@ -921,6 +918,7 @@ function buildMcpServers(tools: Tool[], queryCtx: QueryContext, hasToolReference
 		description: packToolDescription(tool.description, CC_MCP_DESCRIPTION_LIMIT, hasToolReference) ?? "",
 		inputSchema: tool.parameters,
 		handler: async (toolCallId: string) => {
+			if (queryCtx.retired) return { content: [{ type: "text", text: "Query retired after compaction" }], isError: true };
 			if (queryCtx.pendingResults.has(toolCallId)) {
 				const result = queryCtx.pendingResults.get(toolCallId)!;
 				queryCtx.pendingResults.delete(toolCallId);
@@ -929,6 +927,10 @@ function buildMcpServers(tools: Tool[], queryCtx: QueryContext, hasToolReference
 			}
 			debug(`mcp handler: ${tool.name} [${toolCallId}] → waiting`);
 			return new Promise<McpResult>((resolve) => {
+				if (queryCtx.retired) {
+					resolve({ content: [{ type: "text", text: "Query retired after compaction" }], isError: true });
+					return;
+				}
 				queryCtx.pendingToolCalls.set(toolCallId, { toolName: tool.name, resolve });
 			});
 		},
@@ -1236,6 +1238,7 @@ async function consumeQuery(
 
 	try {
 	for await (const message of sdkQuery) {
+		if (queryCtx.retired) break;
 		// Retain the ID for cleanup even if a later message throws, the host
 		// stream already ended on tool_use, or an abort arrived before init.
 		if (message.type === "system" && message.subtype === "init" && message.session_id) {
@@ -1440,7 +1443,7 @@ function steerBlocks(messages: Context["messages"], c: QueryContext): ContentBlo
  *  session is marked: a subagent's lost steer is not the parent's. The query
  *  context keeps the flag too, for a first query that has no session yet. */
 function steerMissedSession(c: QueryContext, text: string): void {
-	if (!c.ownsSharedSession) {
+	if (c.retired || !c.ownsSharedSession) {
 		debug(`provider: steer never reached an isolated query, not marking the shared session: ${text.slice(0, 60)}`);
 		return;
 	}
@@ -1464,6 +1467,7 @@ async function deliverToolResults(
 	steer: ContentBlockParam[] | null,
 	contextLength: number,
 ): Promise<void> {
+	if (c.retired) return;
 	if (steer) {
 		const text = steer.map((b) => (b.type === "text" ? b.text : "[image]")).join("\n");
 		if (!c.promptStream) {
@@ -1472,8 +1476,10 @@ async function deliverToolResults(
 		} else {
 			try {
 				await c.promptStream.push(userMessage(steer, "next"));
+				if (c.retired) return;
 				debug(`provider: steer written to CC stdin before tool result: ${text.slice(0, 60)}`);
 			} catch (error) {
+				if (c.retired) return;
 				// The query is ending — pushing further input would wedge tool-result
 				// delivery, so the steer doesn't reach this query. It is still in
 				// omp's context and the cursor already counts it: force a rebuild.
@@ -1482,6 +1488,7 @@ async function deliverToolResults(
 			}
 		}
 	}
+	if (c.retired) return;
 
 	debug(`provider: tool results, ${results.length} results, ${c.pendingToolCalls.size} waiting handlers, ctx.msgs=${contextLength}`);
 	for (const result of results) {
@@ -1546,6 +1553,22 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// (everything after the last assistant message) and match against waiting MCP
 	// handlers. Results that arrive before their handler get queued in pendingResults.
 	if (resultCtx) {
+		// A compact event belongs to this main query, not to an isolated child.
+		// Handle it before duplicate-ID checks, stream swaps or cursor updates.
+		if (resultCtx.compactionPending && resultCtx.ownsSharedSession && !isSideRequest && ctx() === resultCtx) {
+			resultCtx.retire?.();
+			resultCtx.retired = true;
+			replaceMainContext(resultCtx);
+			if (options?.signal?.aborted) {
+				queueMicrotask(() => {
+					stream.push({ type: "done", reason: "stop", message: newAssistantOutput(model, "", "stop") });
+					markStreamComplete(stream);
+					stream.end();
+				});
+				return stream;
+			}
+			return startFreshQuery(model, context, options, stream, splitPendingInput(context.messages), false, false, true);
+		}
 		// A duplicate callback (every result already delivered) must not replace the
 		// waiting output stream or release handlers while the original steer push
 		// still awaits its ack. Decided by result id, not context length: a mid-run
@@ -1597,7 +1620,6 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// emit end_turn so pi waits for the next real user message. Unless input is
 	// waiting next to the result (a reminder omp added before it): that goes to
 	// a fresh query, with the result rebuilt into history, instead of vanishing.
-	const lastMsg = context.messages[context.messages.length - 1];
 	if (allResults.length > 0 && (pendingInput.blocks.length === 0 || options?.signal?.aborted)) {
 		debug(`provider: orphaned tool result after abort, emitting end_turn`);
 		if (sharedSession && !activeQuery) {
@@ -1611,6 +1633,21 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		});
 		return stream;
 	}
+	return startFreshQuery(model, context, options, stream, pendingInput, isSideRequest, activeQuery, false);
+}
+
+/** Start either an ordinary turn or a compacted midturn continuation. */
+function startFreshQuery(
+	model: Model<any>,
+	context: Context,
+	options: SimpleStreamOptions | undefined,
+	stream: AssistantMessageEventStream,
+	pendingInput: PendingInput,
+	isSideRequest: boolean,
+	activeQuery: boolean,
+	afterCompaction: boolean,
+): AssistantMessageEventStream {
+	const lastMsg = context.messages[context.messages.length - 1];
 
 	// --- Fresh query ---
 
@@ -1627,15 +1664,24 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	queryCtx.pendingToolCalls.clear();
 	queryCtx.pendingResults.clear();
 	queryCtx.resetTurnState(model);
-	queryCtx.latestCursor = 0;
+	queryCtx.latestCursor = afterCompaction ? context.messages.length : 0;
 	queryCtx.deliveredResultIds.clear();
+	if (afterCompaction) {
+		for (const message of pendingInput.history) {
+			if (message.role === "toolResult" && message.toolCallId) queryCtx.deliveredResultIds.add(message.toolCallId);
+		}
+	}
 	queryCtx.inputMissed = false;
+	queryCtx.compactionPending = false;
 
 	const { mcpTools, customToolNameToSdk, customToolNameToPi } = resolveMcpTools(context, askClaudeToolName);
 	const cwd = (options as { cwd?: string } | undefined)?.cwd ?? process.cwd();
 	const claudeDir = process.env.CLAUDE_CONFIG_DIR;
 	const parentSessionId = sharedSession?.sessionId;
-	const promptBlocks = pendingInput.blocks.length ? (pendingInput.blocks as ContentBlockParam[]) : null;
+	const continuation = "Compaction finished. Continue the original unfinished work from the summary and recorded tool results. Honor any new instructions below. Do not redo completed tools or start a new handoff unless requested.";
+	const promptBlocks = afterCompaction
+		? [...promptMessageBlocks({ role: "developer", content: continuation }), ...pendingInput.blocks] as ContentBlockParam[]
+		: pendingInput.blocks.length ? (pendingInput.blocks as ContentBlockParam[]) : null;
 	let promptText = "";
 	if (pendingInput.pendingIndices.length > 1 || context.messages[pendingInput.pendingIndices[0]]?.role === "developer") {
 		debug(`provider: prompt from ${pendingInput.pendingIndices.length} pending message(s): ${pendingInput.pendingIndices.map((i) => `[${i}]${context.messages[i].role}`).join(" ")}${pendingInput.interleaved ? " (interleaved)" : ""}`);
@@ -1759,7 +1805,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	let capturedSessionId: string | undefined;
 	let ownsSharedSession = !isIsolated;
 	const generation = sessionGeneration;
-	const canUpdateSharedSession = () => ownsSharedSession && generation === sessionGeneration;
+	const canUpdateSharedSession = () => ownsSharedSession && !queryCtx.retired && generation === sessionGeneration;
 	const cleanupEphemeralSessions = () => {
 		if (ownsSharedSession) return;
 		if (resumeSessionId && resumeSessionId !== parentSessionId && resumeSessionId !== sharedSession?.sessionId) {
@@ -1777,7 +1823,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	let wasAborted = false;
 	let sdkQuery: Query;
 	try {
-		const syncResult = syncSharedSession(pendingInput.history as Context["messages"], cwd, customToolNameToSdk, model.id, isIsolated, pendingInput.interleaved);
+		const syncResult = syncSharedSession(pendingInput.history as Context["messages"], cwd, customToolNameToSdk, model.id, isIsolated, afterCompaction || pendingInput.interleaved);
 		resumeSessionId = syncResult.sessionId;
 		ownsSharedSession = !isIsolated && !syncResult.preserveSharedSession;
 		queryCtx.ownsSharedSession = ownsSharedSession;
@@ -1811,8 +1857,28 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		void sdkQuery.interrupt().catch(() => {});
 		try { sdkQuery.close(); } catch {}
 	};
+	const retireQuery = () => {
+		if (queryCtx.retired) return;
+		queryCtx.retired = true;
+		queryCtx.currentPiStream = null;
+		if (queryCtx.activeQuery === sdkQuery) queryCtx.activeQuery = null;
+		activeQueryContexts.delete(queryCtx);
+		discardWarm("live session_compact");
+		if (sharedSession) sharedSession = { ...sharedSession, needsRebuild: true, forceRotate: true };
+		promptStream.fail(new Error("Query retired after compaction"));
+		for (const pending of queryCtx.pendingToolCalls.values()) {
+			pending.resolve({ content: [{ type: "text", text: "Query retired after compaction" }], isError: true });
+		}
+		queryCtx.pendingToolCalls.clear();
+		queryCtx.pendingResults.clear();
+		requestAbort();
+	};
+	queryCtx.retire = retireQuery;
 	const onAbort = () => {
+		if (queryCtx.retired) return;
 		wasAborted = true;
+		// An abort ends this task; a later user turn is not a compact continuation.
+		queryCtx.compactionPending = false;
 		if (canUpdateSharedSession()) discardWarm("abort");
 		drainForAbort(abortCtx, promptStream);
 		abortCtx.pendingToolCalls.clear();
@@ -1834,10 +1900,12 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			try { sdkQuery.close(); } finally { cleanupEphemeralSessions(); }
 		})
 		.then(() => {
+			if (queryCtx.retired) return;
 			debug(`provider: consumeQuery completed, stopReason=${queryCtx.turnOutput?.stopReason}, error=${queryCtx.turnOutput?.errorMessage}, aborted=${wasAborted}`);
 
 			// --- Abort detection in normal completion path ---
 			if (wasAborted || options?.signal?.aborted) {
+				queryCtx.compactionPending = false;
 				if (canUpdateSharedSession() && sharedSession) sharedSession = { ...sharedSession, needsRebuild: true, forceRotate: true };
 				debug(`provider: abort detected${canUpdateSharedSession() ? ", marked sharedSession needsRebuild + forceRotate" : ", preserving sharedSession"}`);
 				if (queryCtx.turnOutput) {
@@ -1866,8 +1934,8 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 				// A steer that never reached CC is in omp's history and counted by the
 				// cursor but not in the JSONL: only a rebuild brings it back. Also on
 				// the first query, when there was no session to mark at the time.
-				const needsRebuild = sharedSession?.needsRebuild || queryCtx.inputMissed;
-				debug(`provider: query done, session=${sessionId.slice(0, 8)}, cursor=${cursor}${sharedSession?.needsRebuild ? " needsRebuild kept" : queryCtx.inputMissed ? " needsRebuild (missed input)" : ""}`);
+				const needsRebuild = sharedSession?.needsRebuild || queryCtx.inputMissed || queryCtx.compactionPending;
+				debug(`provider: query done, session=${sessionId.slice(0, 8)}, cursor=${cursor}${sharedSession?.needsRebuild ? " needsRebuild kept" : queryCtx.compactionPending ? " needsRebuild (live compact)" : queryCtx.inputMissed ? " needsRebuild (missed input)" : ""}`);
 				sharedSession = { ...sharedSession, sessionId, cursor, cwd, ...(needsRebuild ? { needsRebuild: true } : {}) };
 			}
 
@@ -1892,6 +1960,8 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			}
 		})
 		.catch((error) => {
+			if (queryCtx.retired) return;
+			queryCtx.compactionPending = false;
 			debug(`provider: query error, model=${cliModel}, aborted=${Boolean(options?.signal?.aborted)}, error=`, error);
 			if (canUpdateSharedSession()) {
 				discardWarm("query error");
@@ -1920,6 +1990,12 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			queryCtx.currentPiStream = null;
 		})
 		.finally(() => {
+			if (queryCtx.retire === retireQuery) {
+				queryCtx.retire = null;
+				// A compact event can arrive after abort but before this finalizer.
+				// Keep successful handoffs pending; never clear a newer query's flag.
+				if (wasAborted || options?.signal?.aborted) queryCtx.compactionPending = false;
+			}
 			if (options?.signal) options.signal.removeEventListener("abort", onAbort);
 			if (queryCtx.activeQuery === sdkQuery) {
 				// Drain pending handlers for this query
@@ -2352,8 +2428,13 @@ export default function (pi: ExtensionAPI) {
 			sharedSession = { ...sharedSession, needsRebuild: true };
 		}
 	};
-	pi.on("session_compact", (event, ctx) => {
-		if (!ownsSession(ctx)) return;
+	pi.on("session_compact", (event, eventCtx) => {
+		if (!ownsSession(eventCtx)) return;
+		const main = ctx();
+		if (main.activeQuery && main.ownsSharedSession && !main.retired) {
+			main.compactionPending = true;
+			debug("session_compact: live main query marked for handoff");
+		}
 		discardWarm("session_compact");
 		markRebuild(`session_compact:fromExtension=${event.fromExtension}`);
 	});
