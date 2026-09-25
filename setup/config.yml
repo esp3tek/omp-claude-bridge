@@ -1,0 +1,85 @@
+shellPath: C:\Program Files\Git\bin\bash.exe
+modelRoles:
+  smol: openai-codex/gpt-6-luna:low
+  tiny: openai-codex/gpt-6-luna:low
+  commit: openai-codex/gpt-6-luna:low
+  plan: openai-codex/gpt-6-sol:high
+  task: openai-codex/gpt-6-sol:medium
+  vision: openai-codex/gpt-6-sol:medium
+  advisor: openai-codex/gpt-6-sol:medium
+  slow: claude-bridge/claude-fable-5-1:high
+  PLAN_CRITICAL: openai-codex/gpt-6-astra:xhigh
+  memory: openai-codex/gpt-6-sol:low
+  judge: openai-codex/gpt-6-sol:medium
+  default: claude-bridge/claude-opus-5-5-1m:high
+symbolPreset: unicode
+composer:
+  shape: band
+theme:
+  dark: titanium
+setupVersion: 2
+dev:
+  autoqaConsent: denied
+defaultThinkingLevel: auto
+retry:
+  modelFallback: true
+  usageAwareFallback: true
+  usageReservePct: 10
+  usageReservePolicy: auto
+  fallbackRevertPolicy: cooldown-expiry
+  waitForUsageReset: false
+  fallbackChains:
+    claude-bridge/claude-sonnet-5:
+      - openai-codex/gpt-6-sol
+    claude-bridge/claude-fable-5-1:
+      - openai-codex/gpt-6-astra
+    claude-bridge/claude-opus-5-5:
+      - openai-codex/gpt-6-sol
+    claude-bridge/claude-opus-5:
+      - openai-codex/gpt-6-sol
+    claude-bridge/claude-haiku-4-5:
+      - openai-codex/gpt-6-luna
+    claude-bridge/*:
+      - openai-codex/gpt-6-sol
+    openai-codex/gpt-6-luna:
+      - claude-bridge/claude-haiku-4-5
+    openai-codex/gpt-6-sol:
+      - claude-bridge/claude-opus-5-5
+    openai-codex/gpt-5.6-luna:
+      - claude-bridge/claude-haiku-4-5
+    openai-codex/gpt-5.6-terra:
+      - claude-bridge/claude-sonnet-5
+    openai-codex/gpt-5.5:
+      - claude-bridge/claude-sonnet-5
+    openai-codex/gpt-5.6-sol:
+      - claude-bridge/claude-opus-5-5
+    openai-codex/gpt-6-astra:
+      - claude-bridge/claude-fable-5-1
+    openai-codex/*:
+      - claude-bridge/claude-sonnet-5
+compaction:
+  thresholdTokens: 160000
+  methodOrder:
+    - remote
+    - handoff
+    - shake
+    - soft
+  idleEnabled: true
+  idleThresholdTokens: 80000
+  midTurnEnabled: true
+browser:
+  relay: true
+disabledProviders:
+  - ollama
+  - llama.cpp
+  - lm-studio
+task:
+  maxConcurrency: 6
+  eager: preferred
+  enableLsp: true
+  enableEffort: true
+  maxEffort: high
+display:
+  cacheMissMarker: true
+recap:
+  enabled: false

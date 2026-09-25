@@ -1,0 +1,8 @@
+{
+  "debug": true,
+  "provider": {
+    "systemPrompt": "host",
+    "pathToClaudeCodeExecutable": "C:/Users/YuriVidal/AppData/Roaming/npm/node_modules/@anthropic-ai/claude-code/bin/claude.exe",
+    "contextWindow": "200k"
+  }
+}

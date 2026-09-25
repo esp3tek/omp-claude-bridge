@@ -163,6 +163,7 @@ if you work with secrets in context, leave debug off or delete the directory aft
 - [How it works](#how-it-works)
 - [Debugging](#debugging)
 - [Development](#development)
+- [Setup examples and reports](setup/README.md)
 - [Credits](#credits)
 - [License](#license)
 
@@ -475,6 +476,10 @@ reviewed excerpt of the `syncResult:` lines and matching CLI log. State whether 
 followed a compact, model switch, subagent or recap.
 
 ## Development
+
+The [`setup/`](setup/README.md) directory contains a personal Windows configuration
+snapshot, role-based usage reports and the historical patch/test archive. It is
+available in the Git checkout; adapt its machine-specific paths before use.
 
 ```bash
 git clone https://github.com/esp3tek/omp-claude-bridge.git
