@@ -37,12 +37,12 @@ export function buildModels<T extends { id: string; [key: string]: any }>(piAiMo
 		.filter((m) => m != null)
 		// Forward thinkingLevelMap so per-model overrides (e.g. opus-4-7 mapping
 		// xhigh->xhigh instead of xhigh->max) are visible to the effort lookup.
-		.map(({ id, name, reasoning, input, contextWindow, maxTokens, thinkingLevelMap }) => ({
+		.map(({ id, name, reasoning, input, contextWindow, maxTokens, thinkingLevelMap, cost }) => ({
 			id,
 			name,
 			reasoning, input, contextWindow, maxTokens,
 			thinkingLevelMap: thinkingLevelMap ?? DEFAULT_THINKING_LEVEL_MAPS[id],
-			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			cost: { ...(cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }) },
 		}));
 }
 

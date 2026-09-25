@@ -34,9 +34,10 @@ This is a fork of [DevVig/omp-claude-bridge](https://github.com/DevVig/omp-claud
 itself a port of [elidickinson/pi-claude-bridge](https://github.com/elidickinson/pi-claude-bridge).
 This repository carries the OMP-specific session, steering and compaction fixes described below.
 
-**Release status:** [v0.9.6](https://github.com/esp3tek/omp-claude-bridge/tree/v0.9.6)
-contains the mid-turn compaction handoff and earlier session-isolation fixes.
-`main` also includes stricter RPC smoke tests: a process crash, an incomplete scenario,
+**Current version: 0.9.7.** Dollar estimates now advance with Claude responses using
+omp's model catalog, including models cached by older bridge versions with zero prices.
+The 0.9.6 mid-turn compaction handoff and earlier session-isolation fixes are included.
+This version also includes stricter RPC smoke tests: a process crash, an incomplete scenario,
 a rejected command or a wrong final answer now fails the test. See the
 [changelog](CHANGELOG.md) and [test guide](tests/README.md) for details.
 
@@ -155,6 +156,7 @@ if you work with secrets in context, leave debug off or delete the directory aft
 - [Quickstart](#quickstart)
 - [Context window controls](#context-window-controls)
 - [Models](#models)
+- [Dollar estimates and quota](#dollar-estimates-and-quota)
 - [AskClaude tool](#askclaude-tool)
 - [Configuration reference](#configuration-reference)
 - [How it works](#how-it-works)
@@ -302,6 +304,19 @@ configured [default window](#default-window).
 | `claude-bridge/claude-haiku-4-5` | 200K (cheapest) |
 
 Bash commands issued by Claude Code get a 120-second default timeout (matching Claude Code's default), since OMP's bash has no timeout by default.
+
+## Dollar estimates and quota
+
+The dollar amount omp accumulates is an **API-equivalent estimate**: the bridge uses
+omp's Anthropic catalog rates and the input, output, cache-read and cache-write tokens
+reported for each response. It is separate from the subscription quota windows and
+does not represent an additional subscription charge. A model absent from the pricing
+catalog remains at zero until catalog pricing is available.
+
+Before 0.9.7, bridge responses were recorded with zero cost. In a session previously
+using another provider, the displayed total could therefore stay at that provider's
+old accumulated amount. Update and restart omp to count new Claude responses.
+Previously saved zero-cost messages are not retroactively recalculated.
 
 ## AskClaude tool
 

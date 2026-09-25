@@ -80,7 +80,7 @@ export async function fetchClaudeCodeModels(pathToClaudeCodeExecutable: string |
 /** Turn discovered models into omp provider model configs (base + window
  *  variants), borrowing catalog metadata (thinking levels, input types, max
  *  output) from omp's own Anthropic entries when it has them. */
-export function toProviderModels<T extends { id: string; name: string; reasoning?: boolean; input?: string[]; contextWindow?: number | null; maxTokens?: number; thinkingLevelMap?: unknown }>(
+export function toProviderModels<T extends { id: string; name: string; reasoning?: boolean; input?: string[]; contextWindow?: number | null; maxTokens?: number; thinkingLevelMap?: unknown; cost?: { input: number; output: number; cacheRead: number; cacheWrite: number } }>(
 	discovered: DiscoveredModel[],
 	catalog: T[],
 	settings: LongContextSettings,
@@ -97,7 +97,7 @@ export function toProviderModels<T extends { id: string; name: string; reasoning
 			contextWindow: cat?.contextWindow ?? 200_000,
 			maxTokens: cat?.maxTokens ?? 32_000,
 			...(cat?.thinkingLevelMap ? { thinkingLevelMap: cat.thinkingLevelMap } : {}),
-			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			cost: { ...(cat?.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }) },
 		};
 	});
 	// Known ids get the measured window policy from models.ts; unknown ones the

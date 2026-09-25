@@ -4,9 +4,24 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.9.7] - 2026-09-25
+
+### Fixed
+- Dollar estimates now advance with Claude responses. Static and discovered models
+  preserve omp's Anthropic catalog rates, and each response's cost includes input,
+  output, cache reads and cache writes in `cost.total`. Earlier versions registered
+  zero prices and never set the total, freezing a mixed-provider session's displayed
+  cost at the amount previously accumulated by other providers.
+- Old cached model entries with zero prices recover the base model's catalog rates
+  at use time, including `-1m` and `-200k` variants. Unknown prices remain zero;
+  no other model's rates are substituted. Existing saved messages are unchanged.
+
+The dollar amount is an API-equivalent estimate from omp's catalog, not an extra
+subscription charge or a measure of remaining quota.
 
 ### Tests
+- Added cost-calculation, model-registration and provider-stream regressions,
+  including repeated usage snapshots and old zero-price cached Opus variants.
 - RPC smoke scripts for compaction, model switching, prewarming and subagents
   fail on process errors, incomplete scenarios, rejected RPC commands and
   assistant errors. They validate the final answer before accepting a clean exit.

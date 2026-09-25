@@ -50,6 +50,7 @@ const queryCalls: QueryArgs[] = [];
 const queries: FakeQuery[] = [];
 let startWarm: ((options: QueryOptions) => Promise<FakeWarm>) | undefined;
 let synchronousQueryError: Error | undefined;
+let catalogModels: Array<{ id: string; cost: { input: number; output: number; cacheRead: number; cacheWrite: number } }> = [];
 const sdkModule = { ...originalSdk };
 const hostModule = { ...originalHost };
 const mcpModule = { ...originalMcp };
@@ -68,7 +69,7 @@ mock.module("@anthropic-ai/claude-agent-sdk", () => ({
 	// Most tests need no prewarm; cache tests provide a controllable warm handle.
 	startup: ({ options }: { options: QueryOptions }) => startWarm?.(options) ?? Promise.reject(new Error("warm-up disabled in test")),
 }));
-mock.module("@oh-my-pi/pi-coding-agent/extensibility/legacy-pi-ai-shim", () => ({ ...hostModule, getModels: () => [] }));
+mock.module("@oh-my-pi/pi-coding-agent/extensibility/legacy-pi-ai-shim", () => ({ ...hostModule, getModels: () => catalogModels }));
 // The bridge still builds the production routing closure. This transport only
 // exposes that closure to the simulated SDK without depending on MCP internals.
 mock.module("../src/mcp-server.js", () => ({
@@ -261,6 +262,7 @@ beforeEach(() => {
 	queries.length = 0;
 	runs.length = 0;
 	synchronousQueryError = undefined;
+	catalogModels = [];
 	startWarm = undefined;
 	T.clearSession();
 	resetStack();
@@ -289,6 +291,33 @@ afterAll(() => {
 	mock.module("@oh-my-pi/pi-coding-agent/extensibility/legacy-pi-ai-shim", () => hostModule);
 	mock.module("os", () => osModule);
 });
+
+for (const streaming of [false, true]) {
+	test(`provider emits per-response cost for an old zero-price Opus variant (streaming=${streaming})`, async () => {
+		catalogModels = [{ id: "claude-opus-5-5", cost: { input: 4, output: 20, cacheRead: 0.2, cacheWrite: 5 } }];
+		const cached = { ...model, id: "claude-opus-5-5-1m", cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } };
+		runs.push(async function* ({ prompt }) {
+			if (typeof prompt !== "string") await prompt[Symbol.asyncIterator]().next();
+			yield { type: "system", subtype: "init", session_id: "12345678-1234-4234-8234-123456789abc" };
+			const usage = { input_tokens: 1000, output_tokens: 200, cache_read_input_tokens: 10000, cache_creation_input_tokens: 2000 };
+			if (streaming) {
+				yield { type: "stream_event", event: { type: "message_start", message: { usage: { ...usage, output_tokens: 0 } } } };
+				for (const output_tokens of [100, 200, 200]) {
+					yield { type: "stream_event", event: { type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens } } };
+				}
+			}
+			yield { type: "assistant", message: { content: [{ type: "text", text: "done" }], usage } };
+			// Query/session totals must never become the cost of each individual response.
+			yield { type: "result", subtype: "success", result: "done", total_cost_usd: 48.313 };
+		});
+		const stream = terminalEvent(T.streamClaudeAgentSdk(cached, context([u("cost test")]), { cwd: root }));
+		await stream.ended.promise;
+		expect(stream.events.at(-1)).toMatchObject({ type: "done", message: { usage: {
+			input: 1000, output: 200, cacheRead: 10000, cacheWrite: 2000,
+			cost: { input: 0.004, output: 0.004, cacheRead: 0.002, cacheWrite: 0.01, total: 0.02 },
+		} } });
+	});
+}
 
 test("a final developer message is an SDK prompt, wrapped as harness input", async () => {
 	const prompts: PromptMessage[] = [];

@@ -1,4 +1,4 @@
-import { StringEnum, Type, getModels, type AssistantMessage, type AssistantMessageEventStream, type Context, type Model, type SimpleStreamOptions, type Tool, type Usage } from "@oh-my-pi/pi-coding-agent/extensibility/legacy-pi-ai-shim";
+import { StringEnum, Type, getModels, type AssistantMessage, type AssistantMessageEventStream, type Context, type Model, type SimpleStreamOptions, type Tool } from "@oh-my-pi/pi-coding-agent/extensibility/legacy-pi-ai-shim";
 import * as piAi from "@oh-my-pi/pi-coding-agent/extensibility/legacy-pi-ai-shim";
 import { type ExtensionAPI, type ExtensionContext, type ExtensionUIContext } from "@oh-my-pi/pi-coding-agent";
 import { keyHint } from "@oh-my-pi/pi-tui/chrome";
@@ -27,6 +27,7 @@ import { buildUsageReport, recordRateLimitEvent } from "./usage.js";
 import { makePromptStream, userMessage, type PromptStream } from "./prompt-stream.js";
 import { createToolServer } from "./mcp-server.js";
 import { fetchClaudeCodeModels, toProviderModels } from "./claude-models.js";
+import { calculateUsageCost } from "./cost.js";
 
 // Compat (#2): use factory if available (pi-ai ≥0.66), else fall back to constructor (gsd-pi etc.)
 const _piAi = piAi as any;
@@ -34,14 +35,6 @@ let newAssistantMessageEventStream: () => AssistantMessageEventStream =
 	typeof _piAi.createAssistantMessageEventStream === "function"
 		? _piAi.createAssistantMessageEventStream
 		: () => new _piAi.AssistantMessageEventStream();
-
-function calculateCost(model: Model<any>, usage: Usage): Usage["cost"] {
-	usage.cost.input = (model.cost.input / 1_000_000) * usage.input;
-	usage.cost.output = (model.cost.output / 1_000_000) * usage.output;
-	usage.cost.cacheRead = (model.cost.cacheRead / 1_000_000) * usage.cacheRead;
-	usage.cost.cacheWrite = (model.cost.cacheWrite / 1_000_000) * usage.cacheWrite;
-	return usage.cost;
-}
 
 // --- Debug logging ---
 // CLAUDE_BRIDGE_DEBUG=1 enables debug logging to ~/.omp/agent/claude-bridge.log.
@@ -949,11 +942,12 @@ function updateUsage(output: AssistantMessage, usage: Record<string, number | un
 	const reasoning = usage.reasoning_tokens ?? usage.thinking_tokens;
 	if (reasoning != null) (output.usage as typeof output.usage & { reasoning?: number }).reasoning = reasoning;
 	output.usage.totalTokens = output.usage.input + output.usage.output + output.usage.cacheRead + output.usage.cacheWrite;
-	calculateCost(model, output.usage);
+	const catalog = getModels("anthropic");
+	output.usage.cost = calculateUsageCost(model, output.usage, Array.isArray(catalog) ? catalog : []);
 	const promptTokens = output.usage.input + output.usage.cacheRead + output.usage.cacheWrite;
 	const cachePct = promptTokens > 0 ? Math.round(output.usage.cacheRead / promptTokens * 100) : 0;
 	const reasoningText = reasoning != null ? ` reasoning=${reasoning}` : "";
-	debug(`usage: in=${output.usage.input} out=${output.usage.output} cacheRead=${output.usage.cacheRead} cacheWrite=${output.usage.cacheWrite} total=${output.usage.totalTokens}${reasoningText} cachePct=${cachePct}% model=${model.id}`);
+	debug(`usage: in=${output.usage.input} out=${output.usage.output} cacheRead=${output.usage.cacheRead} cacheWrite=${output.usage.cacheWrite} total=${output.usage.totalTokens}${reasoningText} cachePct=${cachePct}% estimatedCostUsd=${output.usage.cost.total.toFixed(6)} model=${model.id}`);
 }
 
 // Log the *served* context window reported by an SDK result message
