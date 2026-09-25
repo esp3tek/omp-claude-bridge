@@ -6,14 +6,16 @@ sizes are welcome — bug reports, docs fixes, and features alike.
 ## Getting set up
 
 ```bash
-git clone https://github.com/DevVig/omp-claude-bridge.git
+git clone https://github.com/esp3tek/omp-claude-bridge.git
 cd omp-claude-bridge
 bun install        # or: npm install
 ```
 
 Requirements:
+
 - Node.js >= 20
-- [Bun](https://bun.sh) (recommended) or npm
+- [Bun](https://bun.sh) to run the TypeScript provider tests
+- Node.js 24 for the separate offline RPC smoke-script regressions
 - An Oh My Pi install for end-to-end testing ([omp.sh](https://omp.sh))
 
 ## Developing against a live Oh My Pi
@@ -21,13 +23,13 @@ Requirements:
 Point Oh My Pi at your working copy so changes load on the next run:
 
 ```bash
-pi install /absolute/path/to/omp-claude-bridge
+omp plugin install /absolute/path/to/omp-claude-bridge
 ```
 
 Enable debug logging while iterating:
 
 ```bash
-CLAUDE_BRIDGE_DEBUG=1 pi --list-models claude-bridge
+CLAUDE_BRIDGE_DEBUG=1 omp
 # logs -> ~/.omp/agent/claude-bridge.log
 ```
 
@@ -35,10 +37,14 @@ CLAUDE_BRIDGE_DEBUG=1 pi --list-models claude-bridge
 
 ```bash
 bun run typecheck   # tsc --noEmit
-bun run test        # node --test unit suite
+bun run test        # Bun provider tests + Node unit tests via tsx
+node --test tests/regression/smoke-scripts.test.mjs  # Node 24, offline RPC checks
 ```
 
-Please make sure both pass. CI runs the same two checks on every pull request.
+Run these checks before opening a PR. `bun install` must include the development
+dependencies (`typescript` and `tsx`). CI currently runs typecheck and `bun run test`;
+the separate offline RPC check is manual. See [tests/README.md](tests/README.md) for
+coverage and the real integration scripts, which consume subscription quota.
 
 ## Coding guidelines
 

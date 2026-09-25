@@ -4,6 +4,23 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Tests
+- RPC smoke scripts for compaction, model switching, prewarming and subagents
+  fail on process errors, incomplete scenarios, rejected RPC commands and
+  assistant errors. They validate the final answer before accepting a clean exit.
+- Model-switch checks wait for the `set_model` acknowledgement before sending
+  the next prompt. The subagent check requires an observed `task` invocation.
+- Added 35 offline regression cases that drive the smoke scripts with a simulated
+  omp process, covering successful runs and failure paths without consuming quota.
+
+### Documentation
+- Added update instructions, release/main distinctions, current model mappings,
+  missing configuration options and test-scope guidance.
+- Corrected the default thinking-replay description, settings-source behavior,
+  and contribution commands for this fork.
+
 ## [0.9.6] - 2026-09-24
 
 ### Fixed

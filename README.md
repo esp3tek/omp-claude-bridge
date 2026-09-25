@@ -32,7 +32,13 @@ Authentication and billing run through Claude Code and your Anthropic subscripti
 
 This is a fork of [DevVig/omp-claude-bridge](https://github.com/DevVig/omp-claude-bridge) 0.8.1,
 itself a port of [elidickinson/pi-claude-bridge](https://github.com/elidickinson/pi-claude-bridge).
-Upstream's omp port has not been updated since July 2026, so the fixes below live here.
+This repository carries the OMP-specific session, steering and compaction fixes described below.
+
+**Release status:** [v0.9.6](https://github.com/esp3tek/omp-claude-bridge/tree/v0.9.6)
+contains the mid-turn compaction handoff and earlier session-isolation fixes.
+`main` also includes stricter RPC smoke tests: a process crash, an incomplete scenario,
+a rejected command or a wrong final answer now fails the test. See the
+[changelog](CHANGELOG.md) and [test guide](tests/README.md) for details.
 
 **Ported from `pi-claude-bridge` 0.7.0/0.8.0** (they exist upstream for Pi, not in the 0.8.1 omp port):
 
@@ -59,7 +65,7 @@ Upstream's omp port has not been updated since July 2026, so the fixes below liv
   preset entirely and runs on omp's prompt alone.
 - **The child is isolated from `~/.claude`** (`settingSources: ["project"]`): the user's plugins,
   hooks and skills no longer load on every turn.
-- **Context is never silently lost.** A main-thread context shorter than the session cursor now
+- **Shortened histories trigger a rebuild.** A main-thread context shorter than the session cursor now
   rebuilds the Claude Code session instead of starting clean, which used to run a turn with no
   history at all (upstream #55/#62 reached by a different route). A new reentrant query imports
   its own history into a private session without rebuilding or adopting the shared session.
@@ -82,8 +88,8 @@ Upstream's omp port has not been updated since July 2026, so the fixes below liv
 - **The model list comes from Claude Code's picker** (`supportedModels()`), so a model the installed
   binary and plan actually serve shows up without a code change; the static list is the fallback.
   Adds Claude Fable 5.1 and Opus 5.
-- **Historical `thinking` blocks are not replayed** by default (`provider.replayThinking`), which
-  shrinks rebuilt sessions considerably.
+- **Historical `thinking` replay is limited** by default: `provider.replayThinking: "last"`
+  retains thinking only from the final assistant turn in the rebuilt history.
 
 **Known interaction with Opus 5:** after omp compacts with `snapcompact`, the archive it injects
 carries a preamble describing how to reconstruct a verbatim transcript including the assistant's
@@ -145,6 +151,7 @@ if you work with secrets in context, leave debug off or delete the directory aft
 
 - [Features](#features)
 - [Install](#install)
+- [Update](#update)
 - [Quickstart](#quickstart)
 - [Context window controls](#context-window-controls)
 - [Models](#models)
@@ -160,7 +167,7 @@ if you work with secrets in context, leave debug off or delete the directory aft
 
 - **Claude Code as a provider** — pick Opus / Sonnet / Haiku / Fable from `/model`; tool calls render in OMP's TUI like any native provider.
 - **AskClaude delegation tool** — from any other provider, hand a task or question to Claude Code (read-only, no-tools, or full read/write/bash), optionally in an isolated session.
-- **Switchable context window** — force **1M** or **200K** globally, or leave it on measured per-model defaults. This is the headline addition in this fork.
+- **Switchable context window** — choose **1M** or **200K** in the picker where supported, and configure which window the unsuffixed model id uses.
 - **Session resume & persistence** — conversations survive across turns and reconnects.
 - **Skills + AGENTS.md forwarding** — your OMP skills and context files are passed into Claude Code's system prompt.
 - **Thinking support** — effort levels map through to Claude Code, including `xhigh` on Sonnet models.
@@ -187,6 +194,19 @@ omp plugin install ./omp-claude-bridge
 </details>
 
 Requires Oh My Pi (`omp`) and a working Claude Code login.
+
+## Update
+
+Reinstall from this fork, then restart your running omp sessions:
+
+```bash
+omp plugin install git:github.com/esp3tek/omp-claude-bridge --force
+```
+
+The Git install follows this repository's default branch, including changes made after
+the latest release tag. Editing a separate development clone does not update an already
+installed copy; reinstall it to load those changes. Review [CHANGELOG.md](CHANGELOG.md)
+for runtime changes and the unreleased work on `main`.
 
 ## Quickstart
 
@@ -229,6 +249,9 @@ Both windows stay in the picker regardless of this setting (wherever a runtime e
 
 | Model | 200K entry | 1M entry | `auto` default |
 | ----- | :--------: | :------: | :------------: |
+| `claude-fable-5-1` | ✓ | ✓ | 200K |
+| `claude-opus-5-5` | ✓ | ✓ | 1M |
+| `claude-opus-5` | ✓ | ✓ | 1M |
 | `claude-opus-4-8` | ✓ | ✓ | 1M |
 | `claude-opus-4-7` | — | ✓ | 1M |
 | `claude-opus-4-6` | ✓ | ✓ | 200K¹ |
@@ -248,10 +271,23 @@ The suffixed alternate exists only for the window that isn't the default — e.g
 
 ## Models
 
-Pick any of these from `/model` — each entry shows a `(1M)` or `(200K)` label. The exact ids below assume the default `contextWindow: "auto"`; which id is unsuffixed vs `-1m` / `-200k` follows your configured [default window](#default-window).
+The bridge discovers models from the installed Claude Code picker. The tables document
+the bridge's window mappings; the actual list depends on what Claude Code reports.
+If discovery is unavailable, the static fallback families are Fable 5.1, Opus 5.5,
+Opus 5, Sonnet 5 and Haiku 4.5, using metadata available in omp's model catalog.
+
+Each registered entry shows a `(1M)` or `(200K)` label. The ids below assume
+`contextWindow: "auto"`; which id is unsuffixed vs `-1m` / `-200k` follows your
+configured [default window](#default-window).
 
 | Picker id (auto) | Window |
 | --------- | ------ |
+| `claude-bridge/claude-fable-5-1` | 200K |
+| `claude-bridge/claude-fable-5-1-1m` | 1M |
+| `claude-bridge/claude-opus-5-5` | 1M |
+| `claude-bridge/claude-opus-5-5-200k` | 200K |
+| `claude-bridge/claude-opus-5` | 1M |
+| `claude-bridge/claude-opus-5-200k` | 200K |
 | `claude-bridge/claude-fable-5` | 200K |
 | `claude-bridge/claude-fable-5-1m` | 1M |
 | `claude-bridge/claude-opus-4-8` | 1M |
@@ -291,7 +327,7 @@ You can also bake it into a skill or AGENTS.md, e.g. *"Always call AskClaude to 
 
 ## Configuration reference
 
-Config is read from `~/.omp/agent/claude-bridge.json` (global) and the project OMP config directory `.omp/claude-bridge.json` (project; merged over global). A starter file lives at [`claude-bridge.example.json`](claude-bridge.example.json).
+Config is read from `~/.omp/agent/claude-bridge.json` (global) and the project OMP config directory `.omp/claude-bridge.json` (project; merged over global). A starter file lives at [`claude-bridge.example.json`](claude-bridge.example.json). Restart omp after changing the settings.
 
 ```json
 {
@@ -308,6 +344,12 @@ Config is read from `~/.omp/agent/claude-bridge.json` (global) and the project O
   }
 }
 ```
+
+**Top-level settings**
+
+| Key | Default | Description |
+| --- | ------- | ----------- |
+| `debug` | `false` | Enable verbose logging from the global config file. `CLAUDE_BRIDGE_DEBUG=0` overrides it. See [Debugging](#debugging). |
 
 **`askClaude`**
 
@@ -330,13 +372,25 @@ Config is read from `~/.omp/agent/claude-bridge.json` (global) and the project O
 | `plan` | `"pro"` | Set to `"max"` to enable Opus 4.6 at 1M in `auto`. |
 | `longContextExtraUsage` | `false` | Opt into metered 1M usage (enables Sonnet 4.6 1M everywhere, Opus 4.6 1M on Pro). |
 | `appendSystemPrompt` | `true` | Append OMP's AGENTS.md and skills. |
-| `settingSources` | — | Claude Code filesystem settings to load; only applied when `appendSystemPrompt: false`. |
+| `forwardHostPrompt` | `true` | Forward omp's system prompt and full tool reference when `appendSystemPrompt` is enabled. |
+| `systemPrompt` | `"preset"` | `"preset"` keeps Claude Code's preset with host instructions appended; `"host"` uses the host instructions without that preset. |
+| `replayThinking` | `"last"` | Keep thinking from the final assistant turn in rebuilt history; `"all"` retains every thinking block and `"none"` drops them all. |
+| `prewarm` | `true` | Prepare a Claude Code process between completed turns to reduce startup delay. |
+| `compactTakeover` | `false` | Opt into the bridge's separate compaction-summary handler. By default omp manages compaction. |
+| `compactModel` | `"claude-sonnet-5"` | Summary model when takeover is enabled; `"current"` uses the session model. |
+| `compactFallbackModels` | — | Override the fallback summary models used after a safeguard refusal during takeover. |
+| `compactDeadlineMs` | `25000` | Time budget for the optional takeover handler, before yielding to omp. |
+| `settingSources` | `["project"]` in the default prompt configuration | Override which Claude Code filesystem settings are loaded. Applies independently of `appendSystemPrompt`; alternate prompt configurations have different defaults. |
 | `strictMcpConfig` | `true` | Block MCP servers from `~/.claude.json` / `.mcp.json`. Cloud MCP is always blocked. |
 | `pathToClaudeCodeExecutable` | — | Path to the `claude` binary, if the bundled one can't run on your OS/filesystem. |
 
 ## How it works
 
-OMP's built-in tools are bridged to Claude Code and back, so from your side it behaves like any other OMP provider. Model routing lives in [`src/models.ts`](src/models.ts), which is deliberately free of runtime imports so the context-window policy stays unit-testable in isolation. On registration, the extension projects the pi-ai model list, applies the selected context-window policy, and registers the resulting models with OMP.
+OMP's built-in tools are bridged to Claude Code and back. Model discovery lives in
+[`src/claude-models.ts`](src/claude-models.ts): it reads Claude Code's picker and combines
+those entries with omp's catalog metadata. [`src/models.ts`](src/models.ts) applies the
+context-window policy and supplies a static fallback when discovery is unavailable.
+
 ### Session ownership and side requests
 
 In omp 18.2.11, extension event contexts carry the session's `sessionManager`. The bridge pins
@@ -384,12 +438,18 @@ The bridge does not modify that setting for you.
 
 ## Debugging
 
-Set `CLAUDE_BRIDGE_DEBUG=1` for detailed logs:
+Set `CLAUDE_BRIDGE_DEBUG=1`, or add `"debug": true` to the global
+`~/.omp/agent/claude-bridge.json`, then restart omp. `CLAUDE_BRIDGE_DEBUG=0` forces
+logging off. Logs can contain prompt and tool content; see [Debug logging](#debug-logging)
+before sharing an excerpt.
 
 - **Bridge log** — `~/.omp/agent/claude-bridge.log`: every provider call, session-sync decision, tool-result delivery, and Claude Code stderr. Override the path with `CLAUDE_BRIDGE_DEBUG_PATH`.
 - **Per-query CLI logs** — `~/.omp/agent/cc-cli-logs/<timestamp>-<tag>-<seq>.log`: the Claude Code subprocess's own debug stream, one file per query. Tags are `provider`, `continuation`, or `askclaude`.
 
-When filing a session-resume bug (e.g. "No conversation found"), the `syncResult:` lines from the bridge log plus the matching `cc-cli-logs/` file are the most useful attachments.
+When filing a session-resume bug (e.g. "No conversation found"), include the plugin,
+omp and Claude Code versions, the selected model/window, steps to reproduce, and a
+reviewed excerpt of the `syncResult:` lines and matching CLI log. State whether it
+followed a compact, model switch, subagent or recap.
 
 ## Development
 
@@ -399,10 +459,24 @@ cd omp-claude-bridge
 bun install
 
 bun run typecheck   # tsc --noEmit
-bun run test        # node --test unit suite
+bun run test        # Bun provider tests + Node unit tests via tsx
+
+# Separate offline RPC smoke-script regressions (Node 24)
+node --test tests/regression/smoke-scripts.test.mjs
 ```
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for the full workflow. CI runs typecheck and tests on every push and PR.
+Install development dependencies to provide `tsc` and `tsx`; neither is bundled
+with the plugin installation. On Node 24, the small Node suite can also run directly
+with `node --test tests/unit-*.mjs`.
+
+The offline checks use simulated SDK/RPC processes and do not consume subscription
+quota. The separate integration scripts start real omp sessions and do consume quota;
+their fixtures and commands are documented in [tests/README.md](tests/README.md).
+Passing simulations does not measure live model availability, cache efficiency or quota.
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the full workflow. CI runs typecheck and
+`bun run test` on pushes and PRs to `main`; the separate RPC regression command above
+is currently a manual check.
 
 ## Credits
 

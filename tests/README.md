@@ -1,11 +1,17 @@
 # Tests
 
-## Unit (`bun`, no network, no quota)
+## Unit (Bun + Node, no model requests, no quota)
+
+Run from the development clone after `bun install` (including development dependencies):
 
 ```bash
-node tests/setup-stubs.mjs   # inert stubs for the host packages omp provides at runtime
-bun test tests/*.test.ts
+bun run test  # Bun provider tests, then Node unit tests via tsx
 ```
+
+For a checkout prepared with host stubs, `bun test tests/*.test.ts` runs the provider
+tests separately. `tests/setup-stubs.mjs` supplies inert host imports for that test
+environment; it does not replace dependency installation or typechecking.
+On Node 24, `node --test tests/unit-*.mjs` runs the small Node suite without `tsx`.
 
 Offline regression checks for the RPC smoke scripts (Node 24):
 
@@ -56,10 +62,15 @@ Each script starts `omp --mode rpc` in `%TEMP%\bridge-smoke`, which must exist a
 | `steer-test.mjs` | A steer sent while a tool runs reaches Claude Code in the same turn |
 | `abort-test.mjs` | Abort mid-tool, then a fresh prompt: no hang, history intact |
 | `compact-test.mjs` | `/compact` completes and the turn after it still has the context |
-| `subagent-test.mjs` | Parallel subagents, then a normal turn: the provider survives their teardown |
-| `prewarm-test.mjs` | Time to first token across three turns (pre-warm on vs off) |
+| `subagent-test.mjs` | Requests parallel subagents, requires an observed `task` call, then verifies keyword recall in a normal turn; it does not assert the number or concurrency of children |
+| `prewarm-test.mjs` | Checks three expected replies and reports first-token/total timings; run separately with prewarm enabled and disabled to compare |
 | `switch-test.mjs` | claude-bridge → Codex → claude-bridge without losing history |
 | `models-rpc.mjs` | Which claude-bridge models a live session offers |
 
 `CLAUDE_BRIDGE_DEBUG=1` is set for the child, so `~/.omp/agent/claude-bridge.log` carries the
 session-sync decisions each run made.
+
+The four guarded scripts (`compact`, `switch`, `prewarm`, `subagent`) require a
+completed scenario, successful RPC/assistant results, the expected final reply and
+a clean process exit. Their offline regression checks validate these assertions;
+they do not establish that a live Claude Code integration currently passes.
