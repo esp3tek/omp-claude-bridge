@@ -7,6 +7,17 @@ node tests/setup-stubs.mjs   # inert stubs for the host packages omp provides at
 bun test tests/*.test.ts
 ```
 
+Offline regression checks for the RPC smoke scripts (Node 24):
+
+```bash
+node --test tests/regression/smoke-scripts.test.mjs
+```
+
+These simulate successful conversations, process failures, incomplete scenarios,
+rejected commands and wrong answers without starting omp or consuming quota.
+`compact`, `switch`, `prewarm` and `subagent` require both their final assertions
+and a clean child exit. Model switches are acknowledged before the next prompt.
+
 | File | Covers |
 | ---- | ------ |
 | `session-drift.test.ts` | `syncSharedSession` with explicit history: shortened main contexts rebuild; reentrant history gets a private session; zero-prior side requests preserve the shared session |
