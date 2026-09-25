@@ -32,8 +32,9 @@ and a clean child exit. Model switches are acknowledged before the next prompt.
 | `prompt-stream.test.ts` | The stdin generator: acks resolve on delivery, and abandoning the consumer settles every queued push instead of leaving it pending |
 | `usage.test.ts` | Quota from SDK rate-limit events: `unifiedWindows` fractions, the documented percentage fallback, stale windows, values on an unknown scale |
 | `cost.test.ts` | API-equivalent dollar totals, cache pricing, repeated usage snapshots, preserved catalog prices and recovery of old zero-price model variants |
-| `claude-models.test.ts` | Collapsing Claude Code's picker entries into base model ids and 1M capability |
+| `claude-models.test.ts` | Collapsing picker aliases into base ids, merging 1M/effort capabilities in any order, and preserving reasoning in registered variants |
 | `developer-input.test.ts` | Developer markers, multiple pending inputs, interleaved results, lossless images and rebuilt tool pairing |
+| `unit-context-window.mjs` | Exact model selection; registration/execution consistency for every known family across window, plan and extra-usage settings; unsupported suffixes and restored discovered-model caches |
 | `developer-routing.test.ts` | Real provider routing with simulated SDK `query`/`startup`: developer input during MCP execution, write-ack ordering, duplicate callbacks, orphans, aborts, prewarm reuse and AskClaude history; child/side-history replay and parent isolation; private-file cleanup on completion without init, iterator/startup errors and aborts; lifecycle ownership and late shutdown finalizers; live main-query `session_compact` handoff at tool results, retired-query races, retained JSONL and subsequent tool rounds |
 
 The routing fixture runs the production provider and MCP routing closures, not helper-only

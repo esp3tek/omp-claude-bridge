@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { buildVariantModels, claudeCodeModelId, parseVariantId } from "../src/models.ts";
+import { buildModels, buildVariantModels, claudeCodeModelId, parseVariantId, resolveModel, resolveClaudeCodeRuntimeModel, MODEL_IDS_IN_ORDER, registerDynamicWindows, DYNAMIC_WINDOWS } from "../src/models.ts";
 
 // Minimal stand-ins for pi-ai model entries (buildVariantModels reads id, name,
 // contextWindow and spreads the rest through to each variant).
@@ -111,9 +111,80 @@ test("claudeCodeModelId: a suffixed id forces its window regardless of config", 
 	assert.equal(claudeCodeModelId({ id: "claude-opus-4-6-1m" }, settings("auto")), "claude-opus-4-6[1m]");
 });
 
-test("claudeCodeModelId throws when a model has no runtime for the requested window", () => {
+test("explicit unavailable window suffixes are rejected", () => {
 	assert.throws(() => claudeCodeModelId({ id: "claude-haiku-4-5-1m" }, settings("auto")));
 	assert.throws(() => claudeCodeModelId({ id: "claude-opus-4-7-200k" }, settings("auto")));
-	assert.throws(() => claudeCodeModelId({ id: "claude-haiku-4-5" }, settings("1m")));
-	assert.throws(() => claudeCodeModelId({ id: "claude-opus-4-7" }, settings("200k")));
+});
+
+test("unsuffixed models use their sole available window when the preference is unavailable", () => {
+	assert.equal(claudeCodeModelId({ id: "claude-haiku-4-5" }, settings("1m")), "claude-haiku-4-5");
+	assert.equal(claudeCodeModelId({ id: "claude-opus-4-7" }, settings("200k")), "claude-opus-4-7");
+});
+
+test("exact model ids win over earlier partial matches without changing family aliases", () => {
+	const models = buildModels(MODEL_IDS_IN_ORDER.map(id => ({ id, name: id })));
+	for (const requested of MODEL_IDS_IN_ORDER) {
+		assert.equal(resolveModel(models, requested)?.id, requested);
+		assert.equal(resolveModel([...models].reverse(), requested.toUpperCase())?.id, requested);
+	}
+	assert.equal(resolveModel(models, "opus")?.id, "claude-opus-5-5");
+	assert.equal(resolveModel(models, "fable")?.id, "claude-fable-5-1");
+	assert.equal(resolveModel(models, "missing-model"), undefined);
+});
+
+// Exercise registration and execution together, rather than asserting conflicting
+// behaviors for each helper independently. The tables include every known family.
+for (const contextWindow of ["auto", "1m", "200k"]) {
+	for (const plan of ["pro", "max"]) {
+		for (const longContextExtraUsage of [false, true]) {
+			test(`every picker entry runs at its advertised window (${contextWindow}, ${plan}, extra=${longContextExtraUsage})`, () => {
+				const config = settings(contextWindow, { plan, longContextExtraUsage });
+				const bases = MODEL_IDS_IN_ORDER.map(id => ({ id, name: id }));
+				const list = buildVariantModels(bases, config);
+				assert.equal(new Set(list.map(m => m.id)).size, list.length);
+				for (const entry of list) {
+					const runtimeId = claudeCodeModelId(entry, config);
+					const base = parseVariantId(entry.id).baseId;
+					const servedWindow = runtimeId.endsWith("[1m]") || base === "claude-opus-4-7" ? 1_000_000 : 200_000;
+					assert.equal(entry.contextWindow, servedWindow, entry.id);
+					assert.equal(runtimeId.replace(/\[1m\]$/, ""), base);
+					assert.equal(resolveModel(list, entry.id)?.id, entry.id);
+				}
+				for (const base of bases) {
+					const entry = list.find(m => m.id === base.id);
+					assert.ok(entry, base.id);
+					assert.equal(resolveClaudeCodeRuntimeModel(base.id, config)?.contextWindow, entry.contextWindow);
+				}
+			});
+		}
+	}
+}
+
+test("discovered single-window models also keep a runnable default under a 1M preference", () => {
+	const id = "claude-window-regression";
+	try {
+		registerDynamicWindows(id, { oneM: false });
+		const [entry] = buildVariantModels([{ id, name: id }], settings("1m"));
+		assert.equal(entry.contextWindow, 200_000);
+		assert.equal(claudeCodeModelId(entry, settings("1m")), id);
+		assert.throws(() => claudeCodeModelId({ id: `${id}-1m` }, settings("1m")));
+		// A new omp process restores the model entry without the discovery map.
+		DYNAMIC_WINDOWS.delete(id);
+		assert.equal(claudeCodeModelId(entry, settings("1m")), id);
+	} finally {
+		DYNAMIC_WINDOWS.delete(id);
+	}
+});
+
+test("cached discovered variants preserve their advertised windows without rediscovery", () => {
+	const id = "claude-cached-window-regression";
+	for (const contextWindow of ["auto", "1m", "200k"]) {
+		registerDynamicWindows(id, { oneM: true });
+		const config = settings(contextWindow);
+		const entries = buildVariantModels([{ id, name: id }], config);
+		DYNAMIC_WINDOWS.delete(id);
+		for (const entry of entries) {
+			assert.equal(claudeCodeModelId(entry, config), entry.contextWindow === 1_000_000 ? `${id}[1m]` : id);
+		}
+	}
 });

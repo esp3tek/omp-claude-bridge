@@ -39,9 +39,12 @@ export function collapsePickerModels(entries: Array<{ value: string; resolvedMod
 		const prev = byId.get(id);
 		// Prefer a real name over the "Default (recommended)" alias.
 		if (!prev) {
-			byId.set(id, { id, name: e.displayName, description: e.description, oneM, effortLevels: e.supportedEffortLevels ?? [] });
+			byId.set(id, { id, name: e.displayName, description: e.description, oneM, effortLevels: [...new Set(e.supportedEffortLevels ?? [])] });
 		} else {
 			prev.oneM = prev.oneM || oneM;
+			// The default alias can omit capabilities that a named/window alias
+			// supplies. Merge them all without retaining the SDK's mutable arrays.
+			prev.effortLevels = [...new Set([...prev.effortLevels, ...(e.supportedEffortLevels ?? [])])];
 			if (/^default/i.test(prev.name) && !/^default/i.test(e.displayName)) { prev.name = e.displayName; prev.description = e.description; }
 		}
 	}

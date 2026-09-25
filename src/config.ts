@@ -73,8 +73,9 @@ export interface Config {
 		// Anthropic billing). Enables Sonnet 4.6 [1m] on every plan and Opus 4.6
 		// [1m] on Pro.
 		longContextExtraUsage?: boolean;
-		// Force the Claude Code context window for every model:
-		//   "auto" (default) - per-model policy, "1m" - force 1M, "200k" - force 200K.
+		// Default window for unsuffixed model ids: "auto" follows per-model policy;
+		// "1m" / "200k" prefer that window and fall back to the model's only window.
+		// Explicit variant suffixes remain strict, independent of this preference.
 		contextWindow?: ContextWindowMode;
 	};
 }

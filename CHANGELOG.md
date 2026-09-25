@@ -4,6 +4,27 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.8] - 2026-09-25
+
+### Fixed
+- Exact model ids take precedence over partial matches. AskClaude requests for
+  `claude-opus-5` or `claude-fable-5` now select those models even when Opus 5.5 or
+  Fable 5.1 appears earlier. Short family aliases retain their existing ordering.
+- Registration and execution share the same default-window fallback. Haiku remains
+  usable at 200K under a `1m` preference, and Opus 4.7 at 1M under `200k`.
+  Explicit unsupported suffixes still fail instead of silently changing windows.
+- Cached newly discovered models preserve their advertised window after restart,
+  including 200K-only models used under a `1m` preference.
+- Model discovery merges effort levels across all aliases, without duplicates or
+  shared mutable arrays. An incomplete default alias no longer hides reasoning
+  capabilities supplied by a later named or window-specific alias.
+
+### Tests
+- Added regressions for exact selection, alias ordering, discovery-to-registration
+  reasoning capabilities, cached windows, and all known model families across
+  `auto`/`1m`/`200k`, Pro/Max and both extra-usage settings. Checks verify that each
+  registered entry resolves to the same model and window it advertises.
+
 ## [0.9.7] - 2026-09-25
 
 ### Fixed

@@ -34,11 +34,12 @@ This is a fork of [DevVig/omp-claude-bridge](https://github.com/DevVig/omp-claud
 itself a port of [elidickinson/pi-claude-bridge](https://github.com/elidickinson/pi-claude-bridge).
 This repository carries the OMP-specific session, steering and compaction fixes described below.
 
-**Current version: 0.9.7.** Dollar estimates now advance with Claude responses using
-omp's model catalog, including models cached by older bridge versions with zero prices.
-The 0.9.6 mid-turn compaction handoff and earlier session-isolation fixes are included.
-This version also includes stricter RPC smoke tests: a process crash, an incomplete scenario,
-a rejected command or a wrong final answer now fails the test. See the
+**Current version: 0.9.8.** Exact model selections are respected, default-window
+preferences keep single-window models usable, and discovery preserves effort levels
+across aliases. The dollar estimates introduced in 0.9.7, mid-turn compaction handoff
+and earlier session-isolation fixes are included.
+The RPC smoke tests also reject a process crash, an incomplete scenario,
+a rejected command or a wrong final answer. See the
 [changelog](CHANGELOG.md) and [test guide](tests/README.md) for details.
 
 **Ported from `pi-claude-bridge` 0.7.0/0.8.0** (they exist upstream for Pi, not in the 0.8.1 omp port):
@@ -247,6 +248,10 @@ The **unsuffixed** id (e.g. `claude-opus-4-8`) maps to a default window; the oth
 
 Both windows stay in the picker regardless of this setting (wherever a runtime exists); it only changes which one is the plain, unsuffixed id. So `modelRoles` / `enabledModels` that reference `claude-bridge/claude-opus-4-8` keep working and follow the default.
 
+A model with only one supported window keeps that window even if the preference
+names the other one: Haiku uses 200K under `"1m"`, and Opus 4.7 uses 1M under
+`"200k"`. Explicit unsupported variants such as `claude-haiku-4-5-1m` are rejected.
+
 ### Windows offered per model
 
 | Model | 200K entry | 1M entry | `auto` default |
@@ -331,6 +336,9 @@ Available whenever the active provider is **not** claude-bridge. Your current mo
 You can also bake it into a skill or AGENTS.md, e.g. *"Always call AskClaude to review complicated feature implementations before considering the task complete."*
 
 ### Parameters
+
+An exact model id takes precedence over a partial name. Family aliases such as
+`opus` still select the first matching entry in the bridge's model order.
 
 | Parameter | Values | Description |
 | --------- | ------ | ----------- |

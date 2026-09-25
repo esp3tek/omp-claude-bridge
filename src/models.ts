@@ -1,5 +1,5 @@
 // Canonical selection + display order for the model picker.
-// `resolveModel` returns the first partial match, so `opus` resolves to the first-listed opus entry.
+// Exact ids win; family aliases such as `opus` use the first partial match.
 // Extracted from index.ts so tests can import without activating the extension.
 
 // Models learned at runtime from Claude Code's own picker (see claude-models.ts).
@@ -48,8 +48,9 @@ export function buildModels<T extends { id: string; [key: string]: any }>(piAiMo
 
 // User-selectable context-window policy (see provider.contextWindow in config).
 //   "auto"  - per-model default policy (measured SDK behavior).
-//   "1m"    - force 1M: only register 1M-capable models, request [1m] where needed.
-//   "200k"  - force 200K: only register 200K-capable models, request bare model ids.
+//   "1m"    - prefer 1M; a 200K-only model keeps its sole available window.
+//   "200k"  - prefer 200K; a 1M-only model keeps its sole available window.
+// Explicit variant suffixes are strict requests and never fall back.
 export type ContextWindowMode = "auto" | "1m" | "200k";
 
 export type LongContextSettings = {
@@ -69,14 +70,14 @@ const ONE_M_CONTEXT = 1_000_000;
 // Measured Claude Agent SDK subscription/OAuth behavior. Do not infer this from
 // pi-ai's advertised contextWindow: bare Opus 4.7 serves 1M, bare Opus 4.8 does
 // not, bare Fable 5 serves 200K while claude-fable-5[1m] serves 1M, and [1m]
-// entitlement differs by model. Returns null when a model has no runtime for the
-// requested forced window (that model is hidden from the picker in that mode).
+// entitlement differs by model. The default-window preference falls back to the
+// other supported window, using the same policy for registration and execution.
 export function resolveClaudeCodeRuntimeModel(modelId: string, settings: LongContextSettings): ClaudeCodeRuntimeModel | null {
 	switch (settings.contextWindow) {
 		case "1m":
-			return resolveForcedOneMRuntimeModel(modelId);
+			return resolveForcedOneMRuntimeModel(modelId) ?? resolveForcedTwoHundredKRuntimeModel(modelId);
 		case "200k":
-			return resolveForcedTwoHundredKRuntimeModel(modelId);
+			return resolveForcedTwoHundredKRuntimeModel(modelId) ?? resolveForcedOneMRuntimeModel(modelId);
 		case "auto":
 			return resolveAutoRuntimeModel(modelId, settings);
 	}
@@ -195,8 +196,16 @@ export function parseVariantId(id: string): { baseId: string; forced?: "1m" | "2
 	return { baseId: id };
 }
 
-export function claudeCodeModelId(model: { id: string }, settings: LongContextSettings): string {
+export function claudeCodeModelId(model: { id: string; contextWindow?: number | null }, settings: LongContextSettings): string {
 	const { baseId, forced } = parseVariantId(model.id);
+	// omp restores discovered model entries from its cache without necessarily
+	// rerunning discovery. For an unknown unsuffixed model, the cached window
+	// preserves the capability fallback (e.g. a 200K-only model under "1m").
+	// Known models and explicit suffixes still use their measured/strict policy.
+	if (!forced && !MODEL_IDS_IN_ORDER.includes(baseId) && !DYNAMIC_WINDOWS.has(baseId)) {
+		if (model.contextWindow === TWO_HUNDRED_K_CONTEXT) return baseId;
+		if (model.contextWindow === ONE_M_CONTEXT) return `${baseId}[1m]`;
+	}
 	const runtimeModel = forced === "1m"
 		? resolveForcedOneMRuntimeModel(baseId)
 		: forced === "200k"
@@ -211,7 +220,7 @@ export function claudeCodeModelId(model: { id: string }, settings: LongContextSe
 
 export function resolveModel<T extends { id: string }>(models: T[], input: string): T | undefined {
 	const lower = input.toLowerCase();
-	return models.find((m) => m.id === lower || m.id.includes(lower));
+	return models.find((m) => m.id === lower) ?? models.find((m) => m.id.includes(lower));
 }
 
 function variantName(baseName: string, contextWindow: number): string {
