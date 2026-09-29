@@ -1,0 +1,33 @@
+// Claude Code reports a lost login as an is_error result (api_error_status 401,
+// or text such as "Invalid API key · Please run /login", "Not logged in",
+// "OAuth token has expired", "authentication_failed"). Retrying cannot fix it:
+// only a /login in an interactive Claude Code console does.
+const AUTH_ERROR = /please run \/login|not logged in|invalid api key|oauth token (has )?(expired|revoked)|authentication_failed|authentication_error|invalid (x-api-key|bearer token)|token has been revoked/i;
+
+export function isAuthError(text: string, apiStatus?: number | null): boolean {
+	return apiStatus === 401 || AUTH_ERROR.test(text);
+}
+
+export const AUTH_ADVICE =
+	"Claude Code ha perdido la sesión (401). Abre una consola, ejecuta `claude` y escribe /login; " +
+	"después repite el turno. Reintentar sin iniciar sesión fallará igual.";
+
+/** Thrown for a lost Claude Code login; `status` lets the host classify it as
+ *  a 401 instead of a transient error it would retry. */
+export class ClaudeAuthError extends Error {
+	readonly status = 401;
+	constructor(message: string) {
+		super(message);
+		this.name = "ClaudeAuthError";
+	}
+}
+
+// One notification per burst: side requests and retries hit the same wall.
+const NOTIFY_INTERVAL_MS = 60_000;
+let lastNotifyMs = 0;
+
+export function shouldNotifyAuth(nowMs: number = Date.now()): boolean {
+	if (nowMs - lastNotifyMs < NOTIFY_INTERVAL_MS) return false;
+	lastNotifyMs = nowMs;
+	return true;
+}

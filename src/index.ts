@@ -1,7 +1,7 @@
 import { StringEnum, Type, getModels, type AssistantMessage, type AssistantMessageEventStream, type Context, type Model, type SimpleStreamOptions, type Tool } from "@oh-my-pi/pi-coding-agent/extensibility/legacy-pi-ai-shim";
 import * as piAi from "@oh-my-pi/pi-coding-agent/extensibility/legacy-pi-ai-shim";
 import { type ExtensionAPI, type ExtensionContext, type ExtensionUIContext } from "@oh-my-pi/pi-coding-agent";
-import { keyHint } from "@oh-my-pi/pi-tui/chrome";
+import { keyHint } from "@oh-my-pi/pi-coding-agent/modes/components/keybinding-hints";
 import { buildSessionContext } from "@oh-my-pi/pi-coding-agent/session/session-context";
 import type { CompactionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { compact } from "@oh-my-pi/pi-agent-core/compaction";
@@ -22,6 +22,7 @@ import { loadConfig, type Config } from "./config.js";
 import { extractAgentsAppend } from "./agents-md.js";
 import { buildActionSummary, type ToolCallState } from "./askclaude-ui.js";
 import { ClaudeUsageLimitError, rateLimitNotice, usageLimitError } from "./rate-limit.js";
+import { AUTH_ADVICE, ClaudeAuthError, isAuthError, shouldNotifyAuth } from "./auth.js";
 import { CC_MCP_DESCRIPTION_LIMIT, TOOL_REFERENCE_HEADER, packToolDescription } from "./tool-description.js";
 import { buildUsageReport, recordRateLimitEvent } from "./usage.js";
 import { makePromptStream, userMessage, type PromptStream } from "./prompt-stream.js";
@@ -910,7 +911,7 @@ function buildMcpServers(tools: Tool[], queryCtx: QueryContext, hasToolReference
 		name: tool.name,
 		description: packToolDescription(tool.description, CC_MCP_DESCRIPTION_LIMIT, hasToolReference) ?? "",
 		inputSchema: tool.parameters,
-		handler: async (toolCallId: string) => {
+		handler: async (toolCallId: string): Promise<McpResult> => {
 			if (queryCtx.retired) return { content: [{ type: "text", text: "Query retired after compaction" }], isError: true };
 			if (queryCtx.pendingResults.has(toolCallId)) {
 				const result = queryCtx.pendingResults.get(toolCallId)!;
@@ -1263,6 +1264,11 @@ async function consumeQuery(
 					const errors = (message as any).errors as string[] | undefined;
 					const text = (errors && errors.length > 0 ? errors.join("; ") : (message as any).result) || `Claude Code result ${message.subtype}`;
 					debug(`consumeQuery: result is_error subtype=${message.subtype} api_error_status=${apiStatus} text=${String(text).slice(0, 200)}`);
+					if (isAuthError(String(text), apiStatus)) {
+						debug("consumeQuery: Claude Code login lost");
+						if (shouldNotifyAuth()) piUI?.notify(AUTH_ADVICE, "error");
+						throw new ClaudeAuthError(`401 ${text}\n\n${AUTH_ADVICE}`);
+					}
 					if (apiStatus === 429 || /hit your limit|usage limit|rate limit/i.test(String(text))) {
 						throw new ClaudeUsageLimitError(`429 usage_limit_reached: ${text}`);
 					}
@@ -1968,7 +1974,13 @@ function startFreshQuery(
 			if (queryCtx.turnOutput) {
 				queryCtx.turnOutput.stopReason = options?.signal?.aborted ? "aborted" : "error";
 				queryCtx.turnOutput.errorMessage = error instanceof Error ? error.message : String(error);
-				if (error instanceof ClaudeUsageLimitError) queryCtx.turnOutput.errorStatus = error.status;
+				if (error instanceof ClaudeUsageLimitError || error instanceof ClaudeAuthError) queryCtx.turnOutput.errorStatus = error.status;
+				else if (!options?.signal?.aborted && isAuthError(queryCtx.turnOutput.errorMessage)) {
+					// Login lost outside a result (the CLI exited before answering).
+					if (shouldNotifyAuth()) piUI?.notify(AUTH_ADVICE, "error");
+					queryCtx.turnOutput.errorMessage += `\n\n${AUTH_ADVICE}`;
+					queryCtx.turnOutput.errorStatus = 401;
+				}
 			}
 			if (!isIsolated && queryCtx.activeQuery === sdkQuery) {
 				for (const pending of queryCtx.pendingToolCalls.values()) { pending.resolve({ content: [{ type: "text", text: "Query ended" }] }); }
