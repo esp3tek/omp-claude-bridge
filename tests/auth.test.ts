@@ -3,6 +3,8 @@ import { ClaudeAuthError, isAuthError, shouldNotifyAuth } from "../src/auth.js";
 
 describe("isAuthError", () => {
 	test("detects Claude Code login-lost messages", () => {
+		// Real result text from claude-bridge.log, 2026-09-25 (api_error_status=null).
+		expect(isAuthError("Failed to authenticate: OAuth session expired and could not be refreshed", null)).toBe(true);
 		expect(isAuthError("Invalid API key · Please run /login")).toBe(true);
 		expect(isAuthError("Not logged in · Please run /login")).toBe(true);
 		expect(isAuthError("OAuth token has expired. Please obtain a new token or refresh your existing token.")).toBe(true);
