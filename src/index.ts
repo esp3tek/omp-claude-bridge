@@ -1,7 +1,6 @@
 import { StringEnum, Type, getModels, type AssistantMessage, type AssistantMessageEventStream, type Context, type Model, type SimpleStreamOptions, type Tool } from "@oh-my-pi/pi-coding-agent/extensibility/legacy-pi-ai-shim";
 import * as piAi from "@oh-my-pi/pi-coding-agent/extensibility/legacy-pi-ai-shim";
 import { type ExtensionAPI, type ExtensionContext, type ExtensionUIContext } from "@oh-my-pi/pi-coding-agent";
-import { keyHint } from "@oh-my-pi/pi-coding-agent/modes/components/keybinding-hints";
 import { buildSessionContext } from "@oh-my-pi/pi-coding-agent/session/session-context";
 import type { CompactionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { compact } from "@oh-my-pi/pi-agent-core/compaction";
@@ -29,6 +28,15 @@ import { makePromptStream, userMessage, type PromptStream } from "./prompt-strea
 import { createToolServer } from "./mcp-server.js";
 import { fetchClaudeCodeModels, toProviderModels } from "./claude-models.js";
 import { calculateUsageCost } from "./cost.js";
+
+// omp >= 18.4 dropped modes/components/keybinding-hints; a static import made the whole
+// extension fail to load ("Cannot find package '@oh-my-pi/pi-coding-agent'"). Resolve it
+// lazily and degrade to the default expand key when the module is gone.
+let keyHint: (id: string, description: string) => string = (_id, description) => `Ctrl+O ${description}`;
+try {
+	const hints = await import("@oh-my-pi/pi-coding-agent/modes/components/keybinding-hints");
+	if (typeof hints.keyHint === "function") keyHint = hints.keyHint;
+} catch {}
 
 // Compat (#2): use factory if available (pi-ai ≥0.66), else fall back to constructor (gsd-pi etc.)
 const _piAi = piAi as any;
