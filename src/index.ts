@@ -11,7 +11,7 @@ import { createSession, deleteSession, repairToolPairing } from "cc-session-io";
 import { appendFileSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from "fs";
 import { homedir } from "os";
 import { dirname, join } from "path";
-import { PROVIDER_ID, messageContentToText, convertPiMessages, importMessagesLossless, promptMessageBlocks, splitPendingInput, type PendingInput } from "./convert.js";
+import { INTERRUPTED_MARKER, PROVIDER_ID, messageContentToText, convertPiMessages, importMessagesLossless, promptMessageBlocks, splitPendingInput, type PendingInput } from "./convert.js";
 import { buildVariantModels, buildModels, STATIC_FALLBACK_IDS, claudeCodeModelId, type ContextWindowMode, type LongContextSettings, resolveModel as _resolveModel } from "./models.js";
 import { MCP_SERVER_NAME, MCP_TOOL_PREFIX, extractSkillsBlock } from "./skills.js";
 import { verifyWrittenSession as _verifyWrittenSession } from "./session-verify.js";
@@ -256,6 +256,9 @@ interface SessionState {
 
 let sharedSession: SessionState | null = null;
 let sessionGeneration = 0;
+// Context length of the last aborted main-thread turn; the next main prompt marks
+// the user messages before it as interrupted (see splitPendingInput). -1 = none.
+let interruptedPromptEnd = -1;
 let mainSessionManager: ExtensionContext["sessionManager"] | undefined;
 
 // Convert pi messages to Anthropic API format for session import.
@@ -1621,7 +1624,13 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 
 	// New input for this call: every user/developer message after the last
 	// assistant turn (a prompt, harness reminders, a steer that missed its query).
-	const pendingInput = splitPendingInput(context.messages);
+	const isMainPrompt = !isSideRequest && !activeQuery;
+	const pendingInput = splitPendingInput(context.messages, 0, isMainPrompt ? interruptedPromptEnd : -1);
+	if (isMainPrompt && interruptedPromptEnd >= 0) {
+		const marked = pendingInput.blocks.filter((b) => b.type === "text" && b.text === INTERRUPTED_MARKER).length;
+		if (marked) debug(`provider: marked ${marked} aborted prompt(s) as interrupted (aborted context length ${interruptedPromptEnd})`);
+		interruptedPromptEnd = -1;
+	}
 
 	// --- Orphaned tool result (e.g. user aborted a tool call) ---
 	// The query is gone but pi still delivered the result. Nothing to do — just
@@ -1915,6 +1924,7 @@ function startFreshQuery(
 			if (wasAborted || options?.signal?.aborted) {
 				queryCtx.compactionPending = false;
 				if (canUpdateSharedSession() && sharedSession) sharedSession = { ...sharedSession, needsRebuild: true, forceRotate: true };
+				if (canUpdateSharedSession()) interruptedPromptEnd = context.messages.length;
 				debug(`provider: abort detected${canUpdateSharedSession() ? ", marked sharedSession needsRebuild + forceRotate" : ", preserving sharedSession"}`);
 				if (queryCtx.turnOutput) {
 					queryCtx.turnOutput.stopReason = "aborted";
@@ -1973,6 +1983,7 @@ function startFreshQuery(
 			debug(`provider: query error, model=${cliModel}, aborted=${Boolean(options?.signal?.aborted)}, error=`, error);
 			if (canUpdateSharedSession()) {
 				discardWarm("query error");
+				if (wasAborted || options?.signal?.aborted) interruptedPromptEnd = context.messages.length;
 				if ((wasAborted || options?.signal?.aborted) && sharedSession) {
 					sharedSession = { ...sharedSession, needsRebuild: true, forceRotate: true };
 				} else {
@@ -2209,6 +2220,7 @@ function clearSession(event = "test reset"): void {
 	debug(`${event}: clearing session ${sharedSession?.sessionId?.slice(0, 8) ?? "none"}`);
 	sessionGeneration++;
 	sharedSession = null;
+	interruptedPromptEnd = -1;
 	for (const queryCtx of activeQueryContexts) queryCtx.ownsSharedSession = false;
 	discardWarm(event);
 }

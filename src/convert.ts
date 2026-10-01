@@ -108,11 +108,21 @@ export interface PendingInput {
 	interleaved: boolean;
 }
 
+/** Harness note after a prompt the user aborted before any reply. Claude Code's own
+ *  bare "[Request interrupted by user]" inline read to Haiku as a prompt injection. */
+export const INTERRUPTED_MARKER = "<system-reminder>\nThe user interrupted the request above before you replied; it is cancelled. Do not act on it unless the next message asks you to. Respond to the next message.\n</system-reminder>";
+
 /** Split a context into the history a session must hold and the new input to send.
  *  New input = every user/developer message after the last assistant message, not
  *  just the last one: omp can append several (a user prompt plus a reminder, or two
- *  reminders) before calling the provider. */
-export function splitPendingInput(messages: PiMessage[], from = 0): PendingInput {
+ *  reminders) before calling the provider.
+ *
+ *  `interruptedBefore`: length of the context of a turn aborted before any reply.
+ *  omp drops that empty assistant message, so the aborted prompt and the next one
+ *  arrive as consecutive user messages; merged into one turn, Claude obeyed the
+ *  aborted prompt. A user message below that index followed by another pending
+ *  user message gets an interruption note after it. */
+export function splitPendingInput(messages: PiMessage[], from = 0, interruptedBefore = -1): PendingInput {
 	let lastAssistant = -1;
 	for (let i = messages.length - 1; i >= 0; i--) {
 		if (messages[i].role === "assistant") { lastAssistant = i; break; }
@@ -127,7 +137,12 @@ export function splitPendingInput(messages: PiMessage[], from = 0): PendingInput
 	// Indices are ascending and unique, so they form a clean suffix iff the first
 	// one sits exactly `count` from the end.
 	const interleaved = pendingIndices.length > 0 && pendingIndices[0] !== messages.length - pendingIndices.length;
-	const blocks = pendingIndices.flatMap((i) => promptMessageBlocks(messages[i] as { role: string; content?: unknown }));
+	const lastUser = pendingIndices.reduce((last, i) => (messages[i].role === "user" ? i : last), -1);
+	const blocks = pendingIndices.flatMap((i) => {
+		const parts = promptMessageBlocks(messages[i] as { role: string; content?: unknown });
+		const interrupted = messages[i].role === "user" && i < interruptedBefore && i < lastUser;
+		return interrupted ? [...parts, { type: "text" as const, text: INTERRUPTED_MARKER }] : parts;
+	});
 	return { history, pendingIndices, blocks, interleaved };
 }
 

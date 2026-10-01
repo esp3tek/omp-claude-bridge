@@ -7,7 +7,7 @@ import { mkdtempSync, readFileSync, rmSync } from "fs";
 import { join } from "path";
 import { createSession, repairToolPairing } from "cc-session-io";
 import {
-	DEVELOPER_OPEN, DEVELOPER_CLOSE, convertPiMessages, groupUserRuns, importMessagesLossless,
+	DEVELOPER_OPEN, DEVELOPER_CLOSE, INTERRUPTED_MARKER, convertPiMessages, groupUserRuns, importMessagesLossless,
 	promptMessageBlocks, splitPendingInput,
 } from "../src/convert.ts";
 import type { Message as PiMessage } from "@oh-my-pi/pi-coding-agent/extensibility/legacy-pi-ai-shim";
@@ -70,6 +70,21 @@ test("the real failing shape: tool result then reminder is a clean suffix", () =
 	expect(p.interleaved).toBe(false);
 	expect(p.history.length).toBe(3);
 	expect(texts(p.blocks)).toContain("incomplete todo");
+});
+
+test("a prompt aborted before any reply is marked interrupted before the next one", () => {
+	// omp drops the empty aborted assistant message: [aborted prompt, new prompt].
+	const msgs: any[] = [u("a"), a("b"), u("sleep 15"), u("GRANADA")];
+	expect(texts(splitPendingInput(msgs).blocks)).toBe("sleep 15|GRANADA");
+	expect(texts(splitPendingInput(msgs, 0, 3).blocks)).toBe(["sleep 15", INTERRUPTED_MARKER, "GRANADA"].join("|"));
+	// Reminders do not count as the next prompt, and the new prompt is never marked.
+	const withDev: any[] = [u("sleep 15"), dev("r"), u("GRANADA"), dev("r2")];
+	expect(texts(splitPendingInput(withDev, 0, 2).blocks))
+		.toBe(["sleep 15", INTERRUPTED_MARKER, DEVELOPER_OPEN + "r" + DEVELOPER_CLOSE, "GRANADA", DEVELOPER_OPEN + "r2" + DEVELOPER_CLOSE].join("|"));
+	// No abort recorded (e.g. compaction left two user messages): no marker.
+	expect(texts(splitPendingInput([u("summary"), u("next")] as any[]).blocks)).toBe("summary|next");
+	// A lone aborted prompt resent as-is is not marked.
+	expect(texts(splitPendingInput([u("again")] as any[], 0, 1).blocks)).toBe("again");
 });
 
 test("reminder before a tool result is interleaved; `from` skips delivered input", () => {
