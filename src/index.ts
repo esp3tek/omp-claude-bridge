@@ -16,7 +16,7 @@ import { buildVariantModels, buildModels, STATIC_FALLBACK_IDS, claudeCodeModelId
 import { MCP_SERVER_NAME, MCP_TOOL_PREFIX, extractSkillsBlock } from "./skills.js";
 import { verifyWrittenSession as _verifyWrittenSession } from "./session-verify.js";
 import { extractAllToolResults as _extractAllToolResults, type McpResult } from "./extract-tool-results.js";
-import { QueryContext, ctx, replaceMainContext } from "./query-state.js";
+import { QueryContext, ctx, replaceMainContext, stackDepth } from "./query-state.js";
 import { loadConfig, type Config } from "./config.js";
 import { extractAgentsAppend } from "./agents-md.js";
 import { buildActionSummary, type ToolCallState } from "./askclaude-ui.js";
@@ -1596,11 +1596,27 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			});
 			return stream;
 		}
-		if (context.messages.length < resultCtx.latestCursor) {
-			// omp rewrote the history under the live query (mid-run compaction): the
-			// delivered-input position no longer maps onto this context.
-			debug(`provider: context shrank under the live query (${resultCtx.latestCursor} -> ${context.messages.length}), resetting input cursor`);
-			resultCtx.latestCursor = 0;
+		if (context.messages.length < resultCtx.latestCursor && !isSideRequest && !resultCtx.retired) {
+			// omp compacted the history under the live query without a session_compact
+			// the bridge acts on: subagent sessions are non-owning, so their compactions
+			// only show up here. Delivering the results to the live query kept Claude
+			// Code's context full, omp saw the same usage and compacted again on every
+			// call (40 "handoff" summaries in 13 minutes). Retire the query and continue
+			// from the compacted history, as the main-thread compaction path does.
+			const ownsMain = resultCtx.ownsSharedSession && ctx() === resultCtx && stackDepth() === 0;
+			debug(`provider: context shrank under the live query (${resultCtx.latestCursor} -> ${context.messages.length}), retiring it and continuing from the compacted history (${ownsMain ? "main" : "isolated"})`);
+			resultCtx.retire?.();
+			resultCtx.retired = true;
+			if (ownsMain) replaceMainContext(resultCtx);
+			if (options?.signal?.aborted) {
+				queueMicrotask(() => {
+					stream.push({ type: "done", reason: "stop", message: newAssistantOutput(model, "", "stop") });
+					markStreamComplete(stream);
+					stream.end();
+				});
+				return stream;
+			}
+			return startFreshQuery(model, context, options, stream, splitPendingInput(context.messages), false, !ownsMain, true);
 		}
 		for (const r of newResults) if (r.toolCallId) resultCtx.deliveredResultIds.add(r.toolCallId);
 		claimCurrentPiStream(stream, "tool-result", resultCtx);
@@ -1880,8 +1896,11 @@ function startFreshQuery(
 		queryCtx.currentPiStream = null;
 		if (queryCtx.activeQuery === sdkQuery) queryCtx.activeQuery = null;
 		activeQueryContexts.delete(queryCtx);
-		discardWarm("live session_compact");
-		if (sharedSession) sharedSession = { ...sharedSession, needsRebuild: true, forceRotate: true };
+		// An isolated (subagent) query never wrote the shared session.
+		if (queryCtx.ownsSharedSession) {
+			discardWarm("live session_compact");
+			if (sharedSession) sharedSession = { ...sharedSession, needsRebuild: true, forceRotate: true };
+		}
 		promptStream.fail(new Error("Query retired after compaction"));
 		for (const pending of queryCtx.pendingToolCalls.values()) {
 			pending.resolve({ content: [{ type: "text", text: "Query retired after compaction" }], isError: true });

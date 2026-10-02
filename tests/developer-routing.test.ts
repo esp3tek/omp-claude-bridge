@@ -664,31 +664,83 @@ test("a side request preserves a parent's pending post-abort rebuild", async () 
 	expect(T.getSharedSession()).toEqual(shared);
 });
 
-test("a mid-run compaction's shorter context still delivers its new tool results", async () => {
-	// Seen live: omp compacted between provider calls, the callback carried a context
-	// shorter than the one last delivered, the bridge took it for a duplicate, and omp
-	// got three empty stops while Claude Code waited on the tool call forever.
-	const state = { prompts: [] as PromptMessage[], results: [] as ToolResult[], ready: new Deferred<undefined>(), delivered: new Deferred<undefined>(), finish: new Deferred<undefined>() };
+/** A fresh query that records its prompt and imported resume history, then finishes. */
+function continuationRun(seen: { prompts: PromptMessage[]; imported: ImportedSession | null; started: Deferred<undefined> }): Run {
+	return async function* ({ prompt, options }) {
+		seen.imported = importedSession(options.resume);
+		if (typeof prompt !== "string") seen.prompts.push((await prompt[Symbol.asyncIterator]().next()).value);
+		seen.started.resolve(undefined);
+		yield { type: "result", subtype: "success", result: "continued" };
+	};
+}
+
+test("a mid-run compaction's shorter context retires the live query and continues from the compacted history", async () => {
+	// Seen live: omp compacted between provider calls without a session_compact the
+	// bridge acted on. Delivering the results to the live query kept Claude Code's
+	// context full; omp saw the same usage and compacted again on every call.
+	const state = { prompts: [] as PromptMessage[], results: [] as ToolResult[], ready: new Deferred<undefined>(), finish: new Deferred<undefined>() };
 	runs.push(toolRun(["tool-1"], state));
 	T.streamClaudeAgentSdk(model, context([u("initial")], [tool]), { cwd: root });
 	await state.ready.promise;
 	T.getMainQueryContext().latestCursor = 40; // a long pre-compaction context was delivered before
 
-	// The reminder after the result also proves the input cursor was reset: with the
-	// stale cursor (40) it sat "before" the delivered position and was never sent.
+	const seen = { prompts: [] as PromptMessage[], imported: null as ImportedSession | null, started: new Deferred<undefined>() };
+	runs.push(continuationRun(seen));
 	const compacted = context([u("summary of the compacted history"), a(), result("tool-1", "after compaction"), d("post-compaction reminder")], [tool]);
 	const stream = terminalEvent(T.streamClaudeAgentSdk(model, compacted, { cwd: root }));
-	await state.delivered.promise;
-	expect(state.results).toHaveLength(1);
-	expect(JSON.stringify(state.results[0])).toContain("after compaction");
-	expect(promptText(state.prompts[1]!)).toContain(`${DEVELOPER_OPEN}post-compaction reminder${DEVELOPER_CLOSE}`);
-
-	// The same callback again is a real duplicate: nothing new to hand over.
-	const again = terminalEvent(T.streamClaudeAgentSdk(model, compacted, { cwd: root }));
-	await again.ended.promise;
-	expect(state.results).toHaveLength(1);
-	state.finish.resolve(undefined);
+	await seen.started.promise;
+	await queries[0]!.closed.promise;
+	expect(JSON.stringify(state.results)).toContain("Query retired after compaction");
+	const text = promptText(seen.prompts[0]!);
+	expect(text).toContain("Compaction finished");
+	expect(text).toContain(`${DEVELOPER_OPEN}post-compaction reminder${DEVELOPER_CLOSE}`);
+	const history = JSON.stringify(requireImported(seen.imported).content);
+	expect(history).toContain("summary of the compacted history");
+	expect(history).toContain("after compaction");
 	await stream.ended.promise;
+	expect(stream.events.at(-1)).toMatchObject({ type: "done", reason: "stop" });
+	state.finish.resolve(undefined);
+});
+
+test("a subagent's mid-run compaction continues in its own snapshot and leaves the parent session alone", async () => {
+	// Subagent sessions never get session_compact: the shorter context is the only signal.
+	const parent = parentSession();
+	const parentStream = await holdParent(parent);
+	try {
+		const twoCalls = { role: "assistant", content: [
+			{ type: "toolCall", id: "child-1", name: "echo", arguments: {} },
+			{ type: "toolCall", id: "child-2", name: "echo", arguments: {} },
+		], stopReason: "toolUse", timestamp: 1 };
+		const answered = (text: string) => ({ role: "assistant", content: [{ type: "text", text }], stopReason: "stop", timestamp: 1 });
+		const longHistory = [u("p1"), answered("r1"), u("p2"), answered("r2"), u("child task")];
+		const state = { prompts: [] as PromptMessage[], results: [] as ToolResult[], ready: new Deferred<undefined>(), finish: new Deferred<undefined>() };
+		runs.push(toolRun(["child-1", "child-2"], state));
+		T.streamClaudeAgentSdk(model, context(longHistory, [tool]), { cwd: root });
+		await state.ready.promise;
+		// First result arrives with the full context; the second after omp compacted it.
+		T.streamClaudeAgentSdk(model, context([...longHistory, twoCalls, result("child-1", "before compaction")], [tool]), { cwd: root });
+
+		const seen = { prompts: [] as PromptMessage[], imported: null as ImportedSession | null, started: new Deferred<undefined>() };
+		runs.push(continuationRun(seen));
+		const compacted = context([u("child summary"), twoCalls, result("child-1", "before compaction"), result("child-2", "after compaction")], [tool]);
+		const child = terminalEvent(T.streamClaudeAgentSdk(model, compacted, { cwd: root }));
+		await seen.started.promise;
+		await queries[1]!.closed.promise;
+		const resume = queryCalls[2]?.options.resume;
+		expect(resume).toBeDefined();
+		expect(resume).not.toBe(parent.shared.sessionId);
+		expect(promptText(seen.prompts[0]!)).toContain("Compaction finished");
+		const history = JSON.stringify(requireImported(seen.imported).content);
+		expect(history).toContain("child summary");
+		expect(history).toContain("after compaction");
+		expect(history).not.toContain("p1");
+		await child.ended.promise;
+		expectParentUnchanged(parent);
+		state.finish.resolve(undefined);
+	} finally {
+		queries[0]?.close();
+		await parentStream.ended.promise;
+	}
 });
 
 test("active parent keeps its shared session while a child resumes full history and reminder, then removes its own artifacts without init", async () => {
