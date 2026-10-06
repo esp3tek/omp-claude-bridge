@@ -13,6 +13,7 @@
 // Code offers at 1M, and let models.ts turn that into the 200K / 1M variants.
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import { buildVariantModels, MODEL_IDS_IN_ORDER, registerDynamicWindows, type LongContextSettings } from "./models.js";
+import { withSafeSpawn } from "./safe-spawn.js";
 
 const DISCOVERY_TIMEOUT_MS = 12_000;
 
@@ -63,12 +64,12 @@ export async function fetchClaudeCodeModels(pathToClaudeCodeExecutable: string |
 	async function* never(): AsyncGenerator<never> { await new Promise<never>(() => {}); }
 	const q = query({
 		prompt: never() as any,
-		options: {
+		options: withSafeSpawn({
 			tools: [],
 			settingSources: [],
 			permissionMode: "bypassPermissions",
 			...(pathToClaudeCodeExecutable ? { pathToClaudeCodeExecutable } : {}),
-		},
+		}, log),
 	});
 	try {
 		const entries = await withTimeout(DISCOVERY_TIMEOUT_MS, () => q.supportedModels());

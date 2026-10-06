@@ -28,6 +28,7 @@ import { makePromptStream, userMessage, type PromptStream } from "./prompt-strea
 import { createToolServer } from "./mcp-server.js";
 import { fetchClaudeCodeModels, toProviderModels } from "./claude-models.js";
 import { calculateUsageCost } from "./cost.js";
+import { withSafeSpawn } from "./safe-spawn.js";
 
 // omp >= 18.4 dropped modes/components/keybinding-hints; a static import made the whole
 // extension fail to load ("Cannot find package '@oh-my-pi/pi-coding-agent'"). Resolve it
@@ -463,7 +464,7 @@ async function runIsolatedSummaryWith(
 
 		sdkQuery = query({
 			prompt: promptText,
-			options: {
+			options: withSafeSpawn({
 				cwd,
 				env: { ...process.env, DISABLE_AUTO_COMPACT: "1", CLAUDE_CODE_DISABLE_AUTO_MEMORY: "1" },
 				tools: [],
@@ -476,7 +477,7 @@ async function runIsolatedSummaryWith(
 				maxTurns: 1,
 				...(claudeExecutable ? { pathToClaudeCodeExecutable: claudeExecutable } : {}),
 				...makeCliDebugOptions("compact-summary"),
-			},
+			}, debug),
 		});
 
 		if (options?.signal) {
@@ -1409,7 +1410,7 @@ function scheduleWarm(opts: Record<string, unknown>, mcpTools: Tool[]): void {
 	const key = warmKey(opts, mcpTools);
 	const startedAt = Date.now();
 	const generation = warmGeneration;
-	startup({ options: { ...(opts as object), ...makeCliDebugOptions("prewarm") } as any, initializeTimeoutMs: 30_000 })
+	startup({ options: withSafeSpawn({ ...(opts as object), ...makeCliDebugOptions("prewarm") } as any, debug), initializeTimeoutMs: 30_000 })
 		.then((handle) => {
 			if (generation !== warmGeneration) {
 				debug(`prewarm: ready but its generation was discarded; closing`);
@@ -1870,7 +1871,7 @@ function startFreshQuery(
 			`appendSys=${appendSystemPrompt} sysPrompt=${hostOnlyPrompt ? "host" : "preset"} settings=${settingSources ? JSON.stringify(settingSources) : "all"} strictMcp=${strictMcpConfigEnabled}`,
 			`prompt=${(promptBlocks ? promptBlocks.map((b) => (b.type === "text" ? b.text : `[${b.type}]`)).join(" ") : promptText).slice(0, 60)}`);
 		const warm = ownsSharedSession ? takeWarm(warmKey(queryOptions as Record<string, unknown>, mcpTools)) : null;
-		sdkQuery = warm ? warm.query(prompt) : query({ prompt, options: queryOptions });
+		sdkQuery = warm ? warm.query(prompt) : query({ prompt, options: withSafeSpawn(queryOptions, debug) });
 	} catch (error) {
 		promptStream.fail(error instanceof Error ? error : new Error(String(error)));
 		queryCtx.promptStream = null;
@@ -2122,7 +2123,7 @@ async function promptAndWait(
 
 	const sdkQuery = query({
 		prompt,
-		options: {
+		options: withSafeSpawn({
 			cwd,
 			env: { ...process.env, ENABLE_CLAUDEAI_MCP_SERVERS: "0", DISABLE_AUTO_COMPACT: "1" },
 			permissionMode: "bypassPermissions",
@@ -2137,7 +2138,7 @@ async function promptAndWait(
 			...(options?.isolated ? { persistSession: false } : {}),
 			...(claudeExecutable ? { pathToClaudeCodeExecutable: claudeExecutable } : {}),
 			...makeCliDebugOptions("askclaude"),
-		},
+		}, debug),
 	});
 
 	// Abort handling

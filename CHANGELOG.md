@@ -4,6 +4,21 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.12] - 2026-10-06
+
+### Fixed
+- An abort that lands while Claude Code is starting no longer kills omp with
+  `[Uncaught Exception] Error: EPIPE: broken pipe, write`. The SDK never listened
+  for errors on the child's stdin, so a write racing the child's death became an
+  uncaught exception, which omp treats as fatal. Every Claude Code child (provider,
+  prewarm, AskClaude, compaction summary, model discovery) is now spawned through
+  `spawnClaudeCodeProcess` with a stdin error listener; stderr still reaches the
+  debug log.
+
+### Tests
+- `safe-spawn.test.ts` reproduces the race (writes while the child exits) and
+  checks the error is handled and stderr is forwarded.
+
 ## [0.9.8] - 2026-09-25
 
 ### Fixed

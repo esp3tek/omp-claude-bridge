@@ -30,6 +30,7 @@ and a clean child exit. Model switches are acknowledged before the next prompt.
 | `thinking.test.ts` | Historical thinking replay and unique, stable tool IDs after sanitization |
 | `pack.test.ts` | Condensing omp's real tool descriptions (`fixtures-omp-tools.json`) under Claude Code's 2048-character limit while keeping `<critical>` and the examples |
 | `prompt-stream.test.ts` | The stdin generator: acks resolve on delivery, and abandoning the consumer settles every queued push instead of leaving it pending |
+| `safe-spawn.test.ts` | Writing to a Claude Code child while it dies is handled instead of raising an uncaught EPIPE; stderr still reaches the query callback |
 | `usage.test.ts` | Quota from SDK rate-limit events: `unifiedWindows` fractions, the documented percentage fallback, stale windows, values on an unknown scale |
 | `cost.test.ts` | API-equivalent dollar totals, cache pricing, repeated usage snapshots, preserved catalog prices and recovery of old zero-price model variants |
 | `claude-models.test.ts` | Collapsing picker aliases into base ids, merging 1M/effort capabilities in any order, and preserving reasoning in registered variants |
