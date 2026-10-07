@@ -702,6 +702,36 @@ test("a mid-run compaction's shorter context retires the live query and continue
 	state.finish.resolve(undefined);
 });
 
+test("a non-owning top-level query's mid-run compaction leaves a usable main context for the next query", async () => {
+	// Seen live (06/10): a subagent run at top level (parent on another provider)
+	// starts with zero priors, so it preserves the shared session and does not own
+	// it. Its mid-run compaction retired the main context without replacing it, and
+	// every later top-level query broke out on its first SDK message: no output, no
+	// terminal event, the subagent hung until aborted two hours later.
+	T.setSharedSession({ sessionId: "77777777-7777-4777-8777-777777777777", cursor: 7, cwd: root });
+	const state = { prompts: [] as PromptMessage[], results: [] as ToolResult[], ready: new Deferred<undefined>(), finish: new Deferred<undefined>() };
+	runs.push(toolRun(["tool-1"], state));
+	T.streamClaudeAgentSdk(model, context([u("child task")], [tool]), { cwd: root });
+	await state.ready.promise;
+	expect(T.getMainQueryContext().ownsSharedSession).toBe(false);
+	T.getMainQueryContext().latestCursor = 40;
+
+	const seen = { prompts: [] as PromptMessage[], imported: null as ImportedSession | null, started: new Deferred<undefined>() };
+	runs.push(continuationRun(seen));
+	const compacted = context([u("summary of the compacted history"), a(), result("tool-1", "after compaction")], [tool]);
+	const continued = terminalEvent(T.streamClaudeAgentSdk(model, compacted, { cwd: root }));
+	await seen.started.promise;
+	await continued.ended.promise;
+	state.finish.resolve(undefined);
+	expect(T.getMainQueryContext().retired).toBe(false);
+
+	runs.push(successRun([]));
+	const next = terminalEvent(T.streamClaudeAgentSdk(model, context([u("message from the parent")], [tool]), { cwd: root }));
+	const ended = await Promise.race([next.ended.promise.then(() => true), new Promise((r) => setTimeout(() => r(false), 2000))]);
+	expect(ended).toBe(true);
+	expect(next.events.at(-1)).toMatchObject({ type: "done", reason: "stop" });
+});
+
 test("a subagent's mid-run compaction continues in its own snapshot and leaves the parent session alone", async () => {
 	// Subagent sessions never get session_compact: the shorter context is the only signal.
 	const parent = parentSession();

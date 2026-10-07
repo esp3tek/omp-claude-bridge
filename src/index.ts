@@ -1608,7 +1608,11 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			debug(`provider: context shrank under the live query (${resultCtx.latestCursor} -> ${context.messages.length}), retiring it and continuing from the compacted history (${ownsMain ? "main" : "isolated"})`);
 			resultCtx.retire?.();
 			resultCtx.retired = true;
-			if (ownsMain) replaceMainContext(resultCtx);
+			// A non-owning query can still run on the main context (a top-level
+			// subagent that preserved the shared session). Replace it either way: a
+			// retired main context makes every later top-level query stop at its first
+			// SDK message without a terminal event, and the turn hangs.
+			if (ctx() === resultCtx && stackDepth() === 0) replaceMainContext(resultCtx);
 			if (options?.signal?.aborted) {
 				queueMicrotask(() => {
 					stream.push({ type: "done", reason: "stop", message: newAssistantOutput(model, "", "stop") });
@@ -1689,6 +1693,12 @@ function startFreshQuery(
 	// start before the side request completes and must retain the main context.
 	const isReentrant = activeQuery;
 	const isIsolated = isReentrant || isSideRequest;
+	if (!isIsolated && ctx().retired && stackDepth() === 0) {
+		// Last line of defence: a retired context breaks out of consumeQuery on the
+		// first message and never ends the stream.
+		debug("WARNING: main context was left retired; replacing it before the fresh query");
+		replaceMainContext(ctx());
+	}
 	const queryCtx = isIsolated ? new QueryContext() : ctx();
 	debug(`provider: fresh query setup, isReentrant=${isReentrant}, sideChannel=${isSideRequest}, activeContexts=${activeQueryContexts.size}`);
 

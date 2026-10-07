@@ -4,6 +4,21 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.13] - 2026-10-07
+
+### Fixed
+- A top-level subagent that did not own the shared session (it started with zero
+  priors while the parent ran on another provider) retired the main query context
+  on a mid-run compaction without replacing it. Every later top-level query then
+  stopped at its first SDK message with no terminal event, so the turn hung: an IRC
+  message to an idle bridge subagent waited 2 h 24 min until it was aborted. The
+  main context is now replaced whenever it is retired, and a fresh query replaces
+  a main context that was left retired.
+
+### Tests
+- Regression in `developer-routing.test.ts`: after a non-owning top-level
+  compaction, the main context is live and the next query ends with `done`.
+
 ## [0.9.12] - 2026-10-06
 
 ### Fixed
