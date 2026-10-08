@@ -4,6 +4,22 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.14] - 2026-10-08
+
+### Fixed
+- Tool results from one omp session could be routed into another session's Claude
+  Code query. A fresh query on the reused main context kept the previous query's
+  tool-call ids until its first `message_start`; when several idle subagents were
+  revived at once (IRC messages), one subagent's old result matched the other's
+  starting query, its message was written into that Claude Code process and both
+  shared one query. Fresh queries now clear those ids, and each query context is
+  bound to the omp session that started it.
+- AskClaude with a non-Claude model id (seen: `gpt-astra`) is refused at once
+  instead of spawning Claude Code and waiting 24 s for its 404 retries.
+
+### Tests
+- Regressions for the cross-session routing race and the AskClaude model check.
+
 ## [0.9.13] - 2026-10-07
 
 ### Fixed

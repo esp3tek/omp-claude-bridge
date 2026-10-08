@@ -835,18 +835,19 @@ function mapToolArgs(
 let piUI: ExtensionUIContext | null = null;
 const activeQueryContexts = new Set<QueryContext>();
 
-function contextForToolResults(results: McpResult[]): QueryContext | undefined {
+function contextForToolResults(results: McpResult[], sessionId?: string): QueryContext | undefined {
+	const otherSession = (c: QueryContext) => Boolean(sessionId && c.sessionId && c.sessionId !== sessionId);
 	for (const result of results) {
 		const id = result.toolCallId;
 		if (!id) continue;
 		for (const queryCtx of activeQueryContexts) {
-			if (queryCtx.retired || (!queryCtx.activeQuery && !queryCtx.compactionPending)) continue;
+			if (queryCtx.retired || (!queryCtx.activeQuery && !queryCtx.compactionPending) || otherSession(queryCtx)) continue;
 			if (queryCtx.pendingToolCalls.has(id) || queryCtx.pendingResults.has(id) || queryCtx.turnToolCallIds.includes(id) || queryCtx.deliveredResultIds.has(id)) {
 				return queryCtx;
 			}
 		}
 		const main = ctx();
-		if (main.compactionPending && !main.retired && main.ownsSharedSession
+		if (main.compactionPending && !main.retired && main.ownsSharedSession && !otherSession(main)
 			&& (main.turnToolCallIds.includes(id) || main.deliveredResultIds.has(id) || main.pendingToolCalls.has(id))) return main;
 	}
 	return undefined;
@@ -1554,7 +1555,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 
 	const activeQuery = ctx().activeQuery !== null;
 	const allResults = isSideRequest ? [] : extractAllToolResults(context);
-	const resultCtx = allResults.length > 0 ? contextForToolResults(allResults) : undefined;
+	const resultCtx = allResults.length > 0 ? contextForToolResults(allResults, options?.sessionId) : undefined;
 	const isReentrantUserQuery = activeQuery && lastMsgRole === "user" && allResults.length === 0;
 	if (isReentrantUserQuery) {
 		debug(`provider: active query user-only call treated as reentrant fresh query, waitingHandlers=${ctx().pendingToolCalls.size}, ctx.msgs=${context.messages.length}`);
@@ -1708,6 +1709,11 @@ function startFreshQuery(
 	queryCtx.pendingToolCalls.clear();
 	queryCtx.pendingResults.clear();
 	queryCtx.resetTurnState(model);
+	// The previous query's tool-call ids would otherwise survive until this query's
+	// first message_start, and another session's old tool result could match them.
+	queryCtx.turnToolCallIds = [];
+	queryCtx.nextHandlerIdx = 0;
+	queryCtx.sessionId = options?.sessionId;
 	queryCtx.latestCursor = afterCompaction ? context.messages.length : 0;
 	queryCtx.deliveredResultIds.clear();
 	if (afterCompaction) {
@@ -2087,6 +2093,12 @@ async function promptAndWait(
 	const cwd = process.cwd();
 	const requestedModel = options?.model ?? "opus";
 	const model = resolveModel(requestedModel);
+	// An id that is neither a known model nor Claude-shaped (seen: "gpt-astra",
+	// borrowed from the Codex roles) only fails inside Claude Code, after a spawn
+	// and its 404 retries: 24 s for an error. Refuse it here instead.
+	if (!model && !/^(claude|opus|sonnet|haiku|fable|default|best)\b/i.test(requestedModel)) {
+		throw new Error(`AskClaude: "${requestedModel}" is not a Claude model. Use "opus", "sonnet", "haiku", "fable" or a full claude-* id.`);
+	}
 	const modelId = model?.id ?? requestedModel;
 	const cliModel = model ? claudeCodeModelId(model, longContextSettings) : modelId;
 

@@ -32,6 +32,8 @@ export class QueryContext {
 	retire: (() => void) | null = null;
 	// False for concurrent children and zero-history side requests.
 	ownsSharedSession = false;
+	/** omp session that started the query; tool results from another session never route here. */
+	sessionId: string | undefined = undefined;
 	pendingToolCalls = new Map<string, PendingToolCall>();
 	pendingResults = new Map<string, McpResult>();
 	turnToolCallIds: string[] = [];

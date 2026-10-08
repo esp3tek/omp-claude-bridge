@@ -702,6 +702,44 @@ test("a mid-run compaction's shorter context retires the live query and continue
 	state.finish.resolve(undefined);
 });
 
+test("AskClaude refuses a non-Claude model id without spawning Claude Code", async () => {
+	// Seen live: "gpt-astra" reached Claude Code, which spent 24 s on 404 retries.
+	await expect(T.promptAndWait("question", "none", new Map(), undefined, { model: "gpt-astra", isolated: true }))
+		.rejects.toThrow("not a Claude model");
+	expect(queryCalls).toHaveLength(0);
+});
+
+test("a revived subagent's old tool result is not routed into another subagent's query that just started on the main context", async () => {
+	// Seen live (06/10): three idle subagents got IRC messages at once. One started a
+	// fresh query on the reused main context; until its first message_start that
+	// context still listed the previous subagent's tool-call ids, so the next revived
+	// subagent's old yield result matched it. Its message was written into the other
+	// subagent's Claude Code and the two shared one query.
+	const z = { prompts: [] as PromptMessage[], results: [] as ToolResult[], ready: new Deferred<undefined>(), delivered: new Deferred<undefined>(), closeInput: true };
+	runs.push(toolRun(["z-1"], z));
+	T.streamClaudeAgentSdk(model, context([u("z task")], [tool]), { cwd: root, sessionId: "Z" });
+	await z.ready.promise;
+	const zDone = terminalEvent(T.streamClaudeAgentSdk(model, context([u("z task"), a("z-1"), result("z-1", "done")], [tool]), { cwd: root, sessionId: "Z" }));
+	await zDone.ended.promise;
+
+	const gate = new Deferred<undefined>();
+	runs.push(async function* () {
+		await gate.promise;
+		yield { type: "system", subtype: "init", session_id: "12345678-1234-4234-8234-123456789abc" };
+		yield { type: "result", subtype: "success", result: "x finished" };
+	});
+	const x = terminalEvent(T.streamClaudeAgentSdk(model, context([u("x task")], [tool]), { cwd: root, sessionId: "X" }));
+	expect(queryCalls).toHaveLength(2);
+
+	runs.push(successRun([]));
+	const revived = terminalEvent(T.streamClaudeAgentSdk(model, context([u("z task"), a("z-1"), result("z-1", "done"), d("irc for Z")], [tool]), { cwd: root, sessionId: "Z" }));
+	expect(queryCalls).toHaveLength(3);
+	gate.resolve(undefined);
+	const ended = await Promise.race([Promise.all([x.ended.promise, revived.ended.promise]).then(() => true), new Promise((r) => setTimeout(() => r(false), 2000))]);
+	expect(ended).toBe(true);
+	expect(x.events.at(-1)).toMatchObject({ type: "done", reason: "stop" });
+});
+
 test("a non-owning top-level query's mid-run compaction leaves a usable main context for the next query", async () => {
 	// Seen live (06/10): a subagent run at top level (parent on another provider)
 	// starts with zero priors, so it preserves the shared session and does not own
