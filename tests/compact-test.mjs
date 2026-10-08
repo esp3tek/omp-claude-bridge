@@ -1,8 +1,13 @@
 import { spawn } from "node:child_process";
 import { join } from "node:path";
+import { writeFileSync } from "node:fs";
 import { smokeGuard } from "./smoke-guard.mjs";
 const model = process.argv[2] ?? "claude-bridge/claude-haiku-4-5";
-const child = spawn("omp", ["--mode", "rpc", "--no-session", "--auto-approve", "--model", model, "--cwd", join(process.env.TEMP, "bridge-smoke")], { stdio: ["pipe", "pipe", "pipe"], shell: true, env: { ...process.env, CLAUDE_BRIDGE_DEBUG: "1" } });
+// omp >= 18.4 refuses /compact while the whole session fits in keepRecentTokens (20k):
+// "Nothing to compact (session too small)". Shrink the tail so the tiny smoke session compacts.
+const overlay = join(process.env.TEMP, "bridge-smoke", "compact-overlay.yml");
+writeFileSync(overlay, "compaction:\n  keepRecentTokens: 200\n");
+const child = spawn("omp", ["--mode", "rpc", "--no-session", "--auto-approve", "--config", overlay, "--model", model, "--cwd", join(process.env.TEMP, "bridge-smoke")], { stdio: ["pipe", "pipe", "pipe"], shell: true, env: { ...process.env, CLAUDE_BRIDGE_DEBUG: "1" } });
 const send = (o) => child.stdin.write(JSON.stringify(o) + "\n");
 let buf = ""; let step = 0; const t0 = Date.now(); const log = (m) => console.log(`[${((Date.now() - t0) / 1000).toFixed(1)}s] ${m}`);
 let completed = false, compacted = false, finalText = "";

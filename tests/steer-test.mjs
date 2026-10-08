@@ -37,7 +37,8 @@ child.stdout.on("data", (d) => {
 		}
 	}
 });
-// fallback: steer 6s after prompt even if no tool event was recognised
-setTimeout(() => { if (!steered) { steered = true; log("no tool event seen → steer anyway"); send({ id: "s1", type: "steer", message: "Palabra clave: GRANADA" }); } }, 8000);
+// fallback: act 20s after prompt even if no tool event was recognised (the auto
+// thinking classifier alone delays the first tool call to ~8s)
+setTimeout(() => { if (!steered) { steered = true; log("no tool event seen → steer anyway"); send({ id: "s1", type: "steer", message: "Palabra clave: GRANADA" }); } }, 20000);
 setTimeout(() => { if (!done) { log("timeout"); child.kill(); process.exit(2); } }, 120000);
 child.on("exit", (c) => { log(`omp exited ${c}; GRANADA in answer: ${/GRANADA/i.test(text)}`); process.exit(/GRANADA/i.test(text) ? 0 : 1); });
