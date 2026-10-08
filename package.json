@@ -1,6 +1,6 @@
 {
 	"name": "omp-claude-bridge",
-	"version": "0.9.15",
+	"version": "0.9.16",
 	"private": false,
 	"description": "Run Claude Code inside Oh My Pi: omp's own prompt and tools, mid-turn steering, subscription quota, model list from Claude Code's picker.",
 	"keywords": [
@@ -45,7 +45,7 @@
 	},
 	"type": "module",
 	"dependencies": {
-		"@anthropic-ai/claude-agent-sdk": "^0.2.141",
+		"@anthropic-ai/claude-agent-sdk": "^0.3.293",
 		"@anthropic-ai/sdk": "^0.73.0",
 		"cc-session-io": "^0.3.1",
 		"change-case": "^5.4.4",

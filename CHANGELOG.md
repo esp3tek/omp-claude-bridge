@@ -4,6 +4,14 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.16] - 2026-10-08
+
+### Changed
+- `@anthropic-ai/claude-agent-sdk` from `^0.2.141` to `^0.3.293`. The caret kept the
+  bridge on the May 0.2 line while Claude Code moved on; the 0.3 line follows Claude
+  Code's numbering (0.3.293 ↔ Claude Code 2.1.293). No source changes were needed:
+  typecheck clean, unit suites and live abort/steer/subagent smoke tests pass.
+
 ## [0.9.15] - 2026-10-08
 
 Review of 0.9.14 by GPT-6 Astra.
