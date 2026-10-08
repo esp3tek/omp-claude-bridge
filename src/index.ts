@@ -253,6 +253,20 @@ interface SessionState {
 	// A closed live query can still write the old JSONL. Abort and midturn
 	// compaction rotate to a fresh UUID; idle compaction/tree rebuild in place.
 	forceRotate?: boolean;
+	// Which conversation the JSONL holds (see historyRoot). A cursor alone matches any
+	// history of the same length: a different omp session (a subagent run at top level
+	// while the parent is on another provider) would resume this transcript as its own.
+	root?: string;
+}
+
+/** Identify a conversation by its first message: role, timestamp and the start of
+ *  its text. Stable while omp appends; a compaction or handoff rewrites it, and those
+ *  rebuild anyway. */
+function historyRoot(messages: Context["messages"]): string | undefined {
+	const first = messages[0] as { role?: string; timestamp?: number; content?: unknown } | undefined;
+	if (!first) return undefined;
+	const text = typeof first.content === "string" ? first.content : JSON.stringify(first.content ?? "");
+	return `${first.role}:${first.timestamp ?? ""}:${text.slice(0, 200)}`;
 }
 
 let sharedSession: SessionState | null = null;
@@ -678,7 +692,9 @@ function syncSharedSession(
 	// pi-side history rewrites such as /compact and session_tree: without it,
 	// missed = [].slice(cursor) can falsely hit REUSE and resume an unrelated
 	// longer CC session. See issue #25.
-	if (sharedSession && !sharedSession.needsRebuild && !forceRebuild && priorMessages.length >= sharedSession.cursor) {
+	const foreign = Boolean(sharedSession?.root && sharedSession.cursor > 0 && !sharedSession.needsRebuild && !forceRebuild && historyRoot(priorMessages) !== sharedSession.root);
+	if (foreign) debug(`Case 4 foreign: history does not start like session ${sharedSession!.sessionId.slice(0, 8)}; rebuilding into a new session instead of resuming it`);
+	if (sharedSession && !foreign && !sharedSession.needsRebuild && !forceRebuild && priorMessages.length >= sharedSession.cursor) {
 		const missed = priorMessages.slice(sharedSession.cursor);
 		const trailingAssistantOnly =
 			missed.length === 1 && (missed[0] as { role?: string }).role === "assistant";
@@ -694,7 +710,7 @@ function syncSharedSession(
 	// A shorter MAIN context means omp rewrote its history without an event we
 	// handle (pruning, cursor drift, compaction). Rebuild instead of starting
 	// without history. Reentrant and zero-prior side requests returned above.
-	if (sharedSession && !sharedSession.needsRebuild && !forceRebuild && priorMessages.length < sharedSession.cursor) {
+	if (sharedSession && !foreign && !sharedSession.needsRebuild && !forceRebuild && priorMessages.length < sharedSession.cursor) {
 		debug(`Case 4 drift: main context shorter than cursor (${priorMessages.length} < ${sharedSession.cursor}), rebuilding instead of clean start`);
 	}
 
@@ -711,7 +727,8 @@ function syncSharedSession(
 	// existing UUID), so prompt-cache UUIDs stay stable for log correlation
 	// and for any tools that key off them. Skipped only when there's a
 	// concurrent writer we shouldn't race — see forceRotate docs above.
-	const preserveId = previousSessionId !== undefined && !sharedSession?.forceRotate;
+	// Never rewrite another conversation's transcript in place.
+	const preserveId = previousSessionId !== undefined && !sharedSession?.forceRotate && !foreign;
 	// A warm process may hold the JSONL we are about to rewrite.
 	discardWarm("rebuild");
 	if (preserveId) {
@@ -727,7 +744,7 @@ function syncSharedSession(
 	convertAndImportMessages(session, priorMessages, customToolNameToSdk);
 	session.save();
 	verifyWrittenSession(session.jsonlPath, session.sessionId, session.messages.length, cwd);
-	sharedSession = { sessionId: session.sessionId, cursor: priorMessages.length, cwd };
+	sharedSession = { sessionId: session.sessionId, cursor: priorMessages.length, cwd, root: historyRoot(priorMessages) };
 	if (previousSessionId === undefined) {
 		debug(`Case 2: first turn with ${priorMessages.length} prior messages → session ${session.sessionId.slice(0, 8)}, ${session.messages.length} records`);
 	} else if (preserveId) {
@@ -835,19 +852,18 @@ function mapToolArgs(
 let piUI: ExtensionUIContext | null = null;
 const activeQueryContexts = new Set<QueryContext>();
 
-function contextForToolResults(results: McpResult[], sessionId?: string): QueryContext | undefined {
-	const otherSession = (c: QueryContext) => Boolean(sessionId && c.sessionId && c.sessionId !== sessionId);
+function contextForToolResults(results: McpResult[]): QueryContext | undefined {
 	for (const result of results) {
 		const id = result.toolCallId;
 		if (!id) continue;
 		for (const queryCtx of activeQueryContexts) {
-			if (queryCtx.retired || (!queryCtx.activeQuery && !queryCtx.compactionPending) || otherSession(queryCtx)) continue;
+			if (queryCtx.retired || (!queryCtx.activeQuery && !queryCtx.compactionPending)) continue;
 			if (queryCtx.pendingToolCalls.has(id) || queryCtx.pendingResults.has(id) || queryCtx.turnToolCallIds.includes(id) || queryCtx.deliveredResultIds.has(id)) {
 				return queryCtx;
 			}
 		}
 		const main = ctx();
-		if (main.compactionPending && !main.retired && main.ownsSharedSession && !otherSession(main)
+		if (main.compactionPending && !main.retired && main.ownsSharedSession
 			&& (main.turnToolCallIds.includes(id) || main.deliveredResultIds.has(id) || main.pendingToolCalls.has(id))) return main;
 	}
 	return undefined;
@@ -1075,6 +1091,11 @@ function processStreamEvent(
 		} else if (event.content_block?.type === "thinking") {
 			c.turnBlocks.push({ type: "thinking", thinking: "", thinkingSignature: "", index: event.index });
 			c.currentPiStream!.push({ type: "thinking_start", contentIndex: c.turnBlocks.length - 1, partial: c.turnOutput });
+		} else if (event.content_block?.type === "redacted_thinking") {
+			// Kept in the turn without stream events (omp renders nothing for it), so a
+			// rebuild can replay it in place.
+			ensureTurnStarted(c);
+			c.turnBlocks.push({ type: "redactedThinking", data: event.content_block.data ?? "", index: event.index });
 		} else if (event.content_block?.type === "tool_use") {
 			const piName = piToolNameFor(event.content_block.name, customToolNameToPi);
 			if (!piName) {
@@ -1194,6 +1215,9 @@ function processAssistantMessage(message: SDKMessage, model: Model<any>, customT
 			c.currentPiStream?.push({ type: "thinking_start", contentIndex: idx, partial: c.turnOutput });
 			if (block.thinking) c.currentPiStream?.push({ type: "thinking_delta", contentIndex: idx, delta: block.thinking, partial: c.turnOutput });
 			c.currentPiStream?.push({ type: "thinking_end", contentIndex: idx, content: block.thinking ?? "", partial: c.turnOutput });
+		} else if (block.type === "redacted_thinking") {
+			ensureTurnStarted(c);
+			c.turnBlocks.push({ type: "redactedThinking", data: block.data ?? "" });
 		} else if (block.type === "tool_use") {
 			const piName = piToolNameFor(block.name, customToolNameToPi);
 			if (!piName) {
@@ -1555,7 +1579,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 
 	const activeQuery = ctx().activeQuery !== null;
 	const allResults = isSideRequest ? [] : extractAllToolResults(context);
-	const resultCtx = allResults.length > 0 ? contextForToolResults(allResults, options?.sessionId) : undefined;
+	const resultCtx = allResults.length > 0 ? contextForToolResults(allResults) : undefined;
 	const isReentrantUserQuery = activeQuery && lastMsgRole === "user" && allResults.length === 0;
 	if (isReentrantUserQuery) {
 		debug(`provider: active query user-only call treated as reentrant fresh query, waitingHandlers=${ctx().pendingToolCalls.size}, ctx.msgs=${context.messages.length}`);
@@ -1711,9 +1735,10 @@ function startFreshQuery(
 	queryCtx.resetTurnState(model);
 	// The previous query's tool-call ids would otherwise survive until this query's
 	// first message_start, and another session's old tool result could match them.
+	// (Not keyed by options.sessionId: an omp handoff mid-turn starts a new session
+	// id while the live query and its tool ids carry on.)
 	queryCtx.turnToolCallIds = [];
 	queryCtx.nextHandlerIdx = 0;
-	queryCtx.sessionId = options?.sessionId;
 	queryCtx.latestCursor = afterCompaction ? context.messages.length : 0;
 	queryCtx.deliveredResultIds.clear();
 	if (afterCompaction) {
@@ -1990,7 +2015,7 @@ function startFreshQuery(
 				// the first query, when there was no session to mark at the time.
 				const needsRebuild = sharedSession?.needsRebuild || queryCtx.inputMissed || queryCtx.compactionPending;
 				debug(`provider: query done, session=${sessionId.slice(0, 8)}, cursor=${cursor}${sharedSession?.needsRebuild ? " needsRebuild kept" : queryCtx.compactionPending ? " needsRebuild (live compact)" : queryCtx.inputMissed ? " needsRebuild (missed input)" : ""}`);
-				sharedSession = { ...sharedSession, sessionId, cursor, cwd, ...(needsRebuild ? { needsRebuild: true } : {}) };
+				sharedSession = { ...sharedSession, sessionId, cursor, cwd, root: historyRoot(context.messages), ...(needsRebuild ? { needsRebuild: true } : {}) };
 			}
 
 
@@ -2096,8 +2121,9 @@ async function promptAndWait(
 	// An id that is neither a known model nor Claude-shaped (seen: "gpt-astra",
 	// borrowed from the Codex roles) only fails inside Claude Code, after a spawn
 	// and its 404 retries: 24 s for an error. Refuse it here instead.
-	if (!model && !/^(claude|opus|sonnet|haiku|fable|default|best)\b/i.test(requestedModel)) {
-		throw new Error(`AskClaude: "${requestedModel}" is not a Claude model. Use "opus", "sonnet", "haiku", "fable" or a full claude-* id.`);
+	// A prefix match, not a word: Claude Code aliases include "opusplan" and "sonnet[1m]".
+	if (!model && !/^(claude|opus|sonnet|haiku|fable|default|best)/i.test(requestedModel)) {
+		throw new Error(`AskClaude: "${requestedModel}" is not a Claude model. Use a Claude Code alias ("opus", "sonnet", "haiku", "fable", "opusplan") or a full claude-* id.`);
 	}
 	const modelId = model?.id ?? requestedModel;
 	const cliModel = model ? claudeCodeModelId(model, longContextSettings) : modelId;

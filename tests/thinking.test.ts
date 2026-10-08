@@ -57,3 +57,14 @@ test("sanitizing a valid id after its lossy equivalent keeps result pairing stab
   expect(/^[a-zA-Z0-9_-]+$/.test(validId)).toBe(true);
 });
 
+
+test("redacted thinking is replayed in place with the turn's other thinking blocks", () => {
+  const turn = { role: "assistant", provider: "claude-bridge", content: [think("A"), { type: "redactedThinking", data: "R" }, think("B"), { type: "text", text: "answer" }], timestamp: 1 };
+  const kept = convertPiMessages([user("a"), turn], undefined) as any;
+  expect(kept.anthropicMessages[1].content.map((b: any) => b.type)).toEqual(["thinking", "redacted_thinking", "thinking", "text"]);
+  expect(kept.anthropicMessages[1].content[1].data).toBe("R");
+  // An earlier turn drops it together with its thinking under "last".
+  const dropped = convertPiMessages([user("a"), turn, user("b"), asst("2")], undefined) as any;
+  expect(dropped.anthropicMessages[1].content.map((b: any) => b.type)).toEqual(["text"]);
+  expect(dropped.droppedThinking).toBe(3);
+});

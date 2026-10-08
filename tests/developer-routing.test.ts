@@ -674,6 +674,31 @@ function continuationRun(seen: { prompts: PromptMessage[]; imported: ImportedSes
 	};
 }
 
+test("another conversation with a history of the same length never resumes the shared transcript", () => {
+	// A cursor alone matched any history of that length: a subagent run at top level
+	// after another one resumed the other's Claude Code transcript as its own.
+	const z = T.syncSharedSession([u("z task"), a("z-1"), result("z-1", "z result")], root);
+	const zSession = z.sessionId!;
+	const x = T.syncSharedSession([u("x task"), a("x-1"), result("x-1", "x result")], root);
+	expect(x.sessionId).not.toBe(zSession);
+	expect(readFileSync(getSessionPath(zSession, root, root), "utf8")).toContain("z result");
+	// The same conversation continuing still resumes.
+	const again = T.syncSharedSession([u("x task"), a("x-1"), result("x-1", "x result"), { role: "assistant", content: [{ type: "text", text: "done" }], stopReason: "stop", timestamp: 1 } as HostMessage], root);
+	expect(again.sessionId).toBe(x.sessionId);
+});
+
+test("a tool result keeps reaching its live query when omp changes the session id mid-turn (handoff)", async () => {
+	const state = { prompts: [] as PromptMessage[], results: [] as ToolResult[], ready: new Deferred<undefined>(), delivered: new Deferred<undefined>(), closeInput: true };
+	runs.push(toolRun(["tool-1"], state));
+	T.streamClaudeAgentSdk(model, context([u("task")], [tool]), { cwd: root, sessionId: "before-handoff" });
+	await state.ready.promise;
+	const stream = terminalEvent(T.streamClaudeAgentSdk(model, context([u("task"), a(), result("tool-1", "after handoff")], [tool]), { cwd: root, sessionId: "after-handoff" }));
+	await state.delivered.promise;
+	expect(JSON.stringify(state.results)).toContain("after handoff");
+	expect(queryCalls).toHaveLength(1);
+	await stream.ended.promise;
+});
+
 test("a mid-run compaction's shorter context retires the live query and continues from the compacted history", async () => {
 	// Seen live: omp compacted between provider calls without a session_compact the
 	// bridge acted on. Delivering the results to the live query kept Claude Code's
@@ -707,6 +732,14 @@ test("AskClaude refuses a non-Claude model id without spawning Claude Code", asy
 	await expect(T.promptAndWait("question", "none", new Map(), undefined, { model: "gpt-astra", isolated: true }))
 		.rejects.toThrow("not a Claude model");
 	expect(queryCalls).toHaveLength(0);
+});
+
+test("AskClaude passes Claude Code aliases the bridge does not register straight to Claude Code", async () => {
+	for (const alias of ["opusplan", "sonnet[1m]"]) {
+		runs.push(successRun([]));
+		await T.promptAndWait("question", "none", new Map(), undefined, { model: alias, isolated: true });
+		expect(queryCalls.at(-1)?.options.extraArgs?.model).toBe(alias);
+	}
 });
 
 test("a revived subagent's old tool result is not routed into another subagent's query that just started on the main context", async () => {

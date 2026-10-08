@@ -188,6 +188,14 @@ export function convertPiMessages(
 					} else if (isAnthropicProvider && sig) {
 						droppedThinking++;
 					}
+				} else if ((block as { type: string }).type === "redactedThinking") {
+					// Encrypted reasoning travels with the turn's other thinking blocks, in its
+					// position: dropping it alone leaves a gap the API rejects.
+					const data = (block as unknown as { data?: string }).data;
+					const isAnthropicProvider = msg.provider === PROVIDER_ID || msg.api === "anthropic";
+					const keepThinking = thinkingReplay === "all" || (thinkingReplay === "last" && msgIndex === lastAssistantIndex);
+					if (isAnthropicProvider && data && keepThinking) blocks.push({ type: "redacted_thinking", data } as any);
+					else if (isAnthropicProvider && data) droppedThinking++;
 				} else if (block.type === "toolCall") {
 					const toolName = mapPiToolNameToSdk(block.name, customToolNameToSdk);
 					blocks.push({ type: "tool_use", id: sanitizeToolId(block.id, sanitizedIds, usedSanitizedIds), name: toolName, input: block.arguments ?? {} });

@@ -80,7 +80,7 @@ test("main path + needsRebuild: rebuilds in place with full history", () => {
   T.setSharedSession({ sessionId: "66666666-6666-4666-8666-666666666666", cursor: 9, cwd, needsRebuild: true });
   const r = T.syncSharedSession([u("a"), a("b")], cwd, undefined, "claude-sonnet-5", false);
   expect(r.sessionId).toBe("66666666-6666-4666-8666-666666666666");
-  expect(T.getSharedSession()).toEqual({ sessionId: "66666666-6666-4666-8666-666666666666", cursor: 2, cwd });
+  expect(T.getSharedSession()).toEqual({ sessionId: "66666666-6666-4666-8666-666666666666", cursor: 2, cwd, root: "user:1:a" });
 });
 
 test("reentrant with no shared session imports its own history without publishing it", () => {

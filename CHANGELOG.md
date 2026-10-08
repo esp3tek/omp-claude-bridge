@@ -4,6 +4,30 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.15] - 2026-10-08
+
+Review of 0.9.14 by GPT-6 Astra.
+
+### Fixed
+- The shared Claude Code transcript was resumed by any history of the same length.
+  A different conversation (a subagent run at top level after another one) could
+  resume the other's transcript as its own, or rewrite it in place. The shared
+  session now records which conversation it holds (its first message); an
+  unannounced history that starts differently rebuilds into a new session.
+- 0.9.14 routed tool results only within the omp session id that started the
+  query, but an omp handoff starts a new session id mid-turn: the result would
+  have missed its live query and left it waiting. The session filter is removed;
+  clearing the stale tool-call ids is what fixes the cross-subagent routing.
+- AskClaude refused Claude Code aliases the bridge does not register, such as
+  `opusplan` (regression in 0.9.14). The check is now a prefix match.
+- `redacted_thinking` blocks were dropped on capture and on rebuild, leaving a gap
+  between signed thinking blocks. They are kept in place and follow the same
+  `replayThinking` rule as the turn's other thinking blocks.
+
+### Tests
+- Same-length histories from different conversations, tool results across a
+  mid-turn session id change, AskClaude aliases, redacted thinking order.
+
 ## [0.9.14] - 2026-10-08
 
 ### Fixed
