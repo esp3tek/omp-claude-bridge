@@ -10,6 +10,7 @@ const MODELS = [
 	{ id: "claude-opus-4-8", name: "Opus 4.8", contextWindow: 200_000 },
 	{ id: "claude-opus-4-7", name: "Opus 4.7", contextWindow: 1_000_000 },
 	{ id: "claude-opus-4-6", name: "Opus 4.6", contextWindow: 200_000 },
+	{ id: "claude-sonnet-5-5", name: "Sonnet 5.5", contextWindow: 200_000 },
 	{ id: "claude-sonnet-5", name: "Sonnet 5", contextWindow: 200_000 },
 	{ id: "claude-sonnet-4-6", name: "Sonnet 4.6", contextWindow: 200_000 },
 	{ id: "claude-haiku-4-5", name: "Haiku 4.5", contextWindow: 200_000 },
@@ -35,6 +36,9 @@ test("auto (Pro): each model expands to its available windows with correct ids, 
 	// Fable 5: default 200K + 1M alternate.
 	assert.equal(m["claude-fable-5"].contextWindow, 200_000);
 	assert.equal(m["claude-fable-5-1m"].contextWindow, 1_000_000);
+	// Sonnet 5.5: default 1M + 200K alternate, even without extra usage.
+	assert.equal(m["claude-sonnet-5-5"].contextWindow, 1_000_000);
+	assert.equal(m["claude-sonnet-5-5-200k"].contextWindow, 200_000);
 	// Sonnet 5: default 1M + 200K alternate.
 	assert.equal(m["claude-sonnet-5"].contextWindow, 1_000_000);
 	assert.equal(m["claude-sonnet-5-200k"].contextWindow, 200_000);
@@ -46,11 +50,11 @@ test("auto (Pro): each model expands to its available windows with correct ids, 
 	assert.ok(!m["claude-haiku-4-5-1m"], "haiku has no 1M runtime");
 });
 
-test("auto (Pro): 12 entries, and no base model emits two entries for the same window", () => {
+test("auto (Pro): 14 entries, and no base model emits two entries for the same window", () => {
 	const list = variants("auto");
-	assert.equal(list.length, 12);
+	assert.equal(list.length, 14);
 	for (const base of MODELS.map((mm) => mm.id)) {
-		const windows = list.filter((v) => v.id === base || v.id.startsWith(`${base}-`)).map((v) => v.contextWindow);
+		const windows = list.filter((v) => parseVariantId(v.id).baseId === base).map((v) => v.contextWindow);
 		assert.equal(new Set(windows).size, windows.length, `${base} has duplicate windows`);
 	}
 });
@@ -58,6 +62,7 @@ test("auto (Pro): 12 entries, and no base model emits two entries for the same w
 test("the default variant is listed before its suffixed alternate", () => {
 	const ids = variants("auto").map((m) => m.id);
 	assert.ok(ids.indexOf("claude-opus-4-8") < ids.indexOf("claude-opus-4-8-200k"));
+	assert.ok(ids.indexOf("claude-sonnet-5-5") < ids.indexOf("claude-sonnet-5-5-200k"));
 	assert.ok(ids.indexOf("claude-sonnet-5") < ids.indexOf("claude-sonnet-5-200k"));
 	assert.ok(ids.indexOf("claude-fable-5") < ids.indexOf("claude-fable-5-1m"));
 });
@@ -102,6 +107,9 @@ test("claudeCodeModelId: unsuffixed id follows the config default", () => {
 	assert.equal(claudeCodeModelId({ id: "claude-fable-5" }, settings("1m")), "claude-fable-5[1m]");
 	assert.equal(claudeCodeModelId({ id: "claude-opus-4-8" }, settings("auto")), "claude-opus-4-8[1m]");
 	assert.equal(claudeCodeModelId({ id: "claude-opus-4-8" }, settings("200k")), "claude-opus-4-8");
+	assert.equal(claudeCodeModelId({ id: "claude-sonnet-5-5" }, settings("auto")), "claude-sonnet-5-5[1m]");
+	assert.equal(claudeCodeModelId({ id: "claude-sonnet-5-5" }, settings("1m")), "claude-sonnet-5-5[1m]");
+	assert.equal(claudeCodeModelId({ id: "claude-sonnet-5-5" }, settings("200k")), "claude-sonnet-5-5");
 });
 
 test("claudeCodeModelId: a suffixed id forces its window regardless of config", () => {
@@ -109,6 +117,9 @@ test("claudeCodeModelId: a suffixed id forces its window regardless of config", 
 	assert.equal(claudeCodeModelId({ id: "claude-opus-4-8-200k" }, settings("1m")), "claude-opus-4-8");
 	assert.equal(claudeCodeModelId({ id: "claude-fable-5-1m" }, settings("200k")), "claude-fable-5[1m]");
 	assert.equal(claudeCodeModelId({ id: "claude-opus-4-6-1m" }, settings("auto")), "claude-opus-4-6[1m]");
+	assert.equal(claudeCodeModelId({ id: "claude-sonnet-5-5-200k" }, settings("auto")), "claude-sonnet-5-5");
+	assert.equal(claudeCodeModelId({ id: "claude-sonnet-5-5-200k" }, settings("1m")), "claude-sonnet-5-5");
+	assert.equal(claudeCodeModelId({ id: "claude-sonnet-5-5-1m" }, settings("200k")), "claude-sonnet-5-5[1m]");
 });
 
 test("explicit unavailable window suffixes are rejected", () => {
