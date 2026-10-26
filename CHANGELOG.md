@@ -4,6 +4,16 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- Sonnet 5.5 context-window policy: `claude-sonnet-5-5` defaults to 1M via
+  `claude-sonnet-5-5[1m]`, with `claude-sonnet-5-5-200k` as the 200K alternate
+  under `auto`. Both windows remain selectable under forced window preferences.
+  Verified with Claude Code accepting a 420,545-token prompt on
+  `claude-sonnet-5-5[1m]` and reporting `contextWindow: 1000000`, even with
+  organization-level extra usage disabled.
+
 ## [0.9.16] - 2026-10-08
 
 ### Changed

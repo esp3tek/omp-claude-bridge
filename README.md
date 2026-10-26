@@ -264,6 +264,7 @@ names the other one: Haiku uses 200K under `"1m"`, and Opus 4.7 uses 1M under
 | `claude-opus-4-7` | — | ✓ | 1M |
 | `claude-opus-4-6` | ✓ | ✓ | 200K¹ |
 | `claude-fable-5` | ✓ | ✓ | 200K |
+| `claude-sonnet-5-5` | ✓ | ✓ | 1M |
 | `claude-sonnet-5` | ✓ | ✓ | 1M |
 | `claude-sonnet-4-6` | ✓ | ✓ | 200K² |
 | `claude-haiku-4-5` | ✓ | — | 200K |
@@ -303,6 +304,8 @@ configured [default window](#default-window).
 | `claude-bridge/claude-opus-4-7` | 1M |
 | `claude-bridge/claude-opus-4-6` | 200K (1M on Max / Extra Usage) |
 | `claude-bridge/claude-opus-4-6-1m` | 1M |
+| `claude-bridge/claude-sonnet-5-5` | 1M |
+| `claude-bridge/claude-sonnet-5-5-200k` | 200K |
 | `claude-bridge/claude-sonnet-5` | 1M (supports `xhigh`) |
 | `claude-bridge/claude-sonnet-5-200k` | 200K |
 | `claude-bridge/claude-sonnet-4-6` | 200K (supports `xhigh`) |

@@ -17,7 +17,7 @@ export function registerDynamicWindows(id: string, caps: { oneM: boolean }): voi
 // so it still works if discovery lists it or a role references it explicitly.
 export const STATIC_FALLBACK_IDS = ["claude-fable-5-1", "claude-opus-5-5", "claude-opus-5", "claude-sonnet-5", "claude-haiku-4-5"];
 
-export const MODEL_IDS_IN_ORDER = ["claude-fable-5-1", "claude-fable-5", "claude-opus-5-5", "claude-opus-5", "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-5", "claude-sonnet-4-6", "claude-haiku-4-5"];
+export const MODEL_IDS_IN_ORDER = ["claude-fable-5-1", "claude-fable-5", "claude-opus-5-5", "claude-opus-5", "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-5-5", "claude-sonnet-5", "claude-sonnet-4-6", "claude-haiku-4-5"];
 
 // Workaround for models that ship without a thinkingLevelMap. Sonnet 5 and
 // Sonnet 4.6 have no map, so getSupportedThinkingLevels hides xhigh (it's
@@ -104,6 +104,8 @@ function resolveAutoRuntimeModel(modelId: string, settings: LongContextSettings)
 			return { cliModelId: "claude-fable-5-1", contextWindow: TWO_HUNDRED_K_CONTEXT };
 		case "claude-fable-5":
 			return { cliModelId: "claude-fable-5", contextWindow: TWO_HUNDRED_K_CONTEXT };
+		case "claude-sonnet-5-5":
+			return { cliModelId: "claude-sonnet-5-5[1m]", contextWindow: ONE_M_CONTEXT };
 		case "claude-sonnet-5":
 			return { cliModelId: "claude-sonnet-5[1m]", contextWindow: ONE_M_CONTEXT };
 		case "claude-sonnet-4-6":
@@ -136,6 +138,8 @@ function resolveForcedOneMRuntimeModel(modelId: string): ClaudeCodeRuntimeModel 
 			return { cliModelId: "claude-fable-5-1[1m]", contextWindow: ONE_M_CONTEXT };
 		case "claude-fable-5":
 			return { cliModelId: "claude-fable-5[1m]", contextWindow: ONE_M_CONTEXT };
+		case "claude-sonnet-5-5":
+			return { cliModelId: "claude-sonnet-5-5[1m]", contextWindow: ONE_M_CONTEXT };
 		case "claude-sonnet-5":
 			return { cliModelId: "claude-sonnet-5[1m]", contextWindow: ONE_M_CONTEXT };
 		case "claude-sonnet-4-6":
@@ -169,6 +173,8 @@ function resolveForcedTwoHundredKRuntimeModel(modelId: string): ClaudeCodeRuntim
 			return { cliModelId: "claude-fable-5-1", contextWindow: TWO_HUNDRED_K_CONTEXT };
 		case "claude-fable-5":
 			return { cliModelId: "claude-fable-5", contextWindow: TWO_HUNDRED_K_CONTEXT };
+		case "claude-sonnet-5-5":
+			return { cliModelId: "claude-sonnet-5-5", contextWindow: TWO_HUNDRED_K_CONTEXT };
 		case "claude-sonnet-5":
 			return { cliModelId: "claude-sonnet-5", contextWindow: TWO_HUNDRED_K_CONTEXT };
 		case "claude-sonnet-4-6":
