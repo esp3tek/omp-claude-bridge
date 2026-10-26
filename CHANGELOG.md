@@ -4,7 +4,7 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.9.17] - 2026-10-26
 
 ### Added
 - Sonnet 5.5 context-window policy: `claude-sonnet-5-5` defaults to 1M via
@@ -12,7 +12,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   under `auto`. Both windows remain selectable under forced window preferences.
   Verified with Claude Code accepting a 420,545-token prompt on
   `claude-sonnet-5-5[1m]` and reporting `contextWindow: 1000000`, even with
-  organization-level extra usage disabled.
+  organization-level extra usage disabled. (#1, thanks @cduguet)
+
+### Fixed
+- `claude-sonnet-5-5` joins the static model list. omp validates
+  `retry.fallbackChains` before Claude Code's model list is discovered, so every
+  chain naming `claude-bridge/claude-sonnet-5-5` was reported as an unknown model
+  at startup ("Fallback chain … references unknown model").
+
+### Changed
+- `@anthropic-ai/claude-agent-sdk` to `^0.3.310` (Claude Code 2.1.310).
+- Verified with omp 18.12.6. Note: omp caps `claude-haiku-5-5` at 100K, its
+  long-context pricing threshold, although Claude Code serves it with 1M.
 
 ## [0.9.16] - 2026-10-08
 

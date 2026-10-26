@@ -15,7 +15,7 @@ export function registerDynamicWindows(id: string, caps: { oneM: boolean }): voi
 // before discovery, or discovery failing): the families the current Claude
 // Code picker offers. Everything in MODEL_IDS_IN_ORDER keeps its window policy
 // so it still works if discovery lists it or a role references it explicitly.
-export const STATIC_FALLBACK_IDS = ["claude-fable-5-1", "claude-opus-5-5", "claude-opus-5", "claude-sonnet-5", "claude-haiku-4-5"];
+export const STATIC_FALLBACK_IDS = ["claude-fable-5-1", "claude-opus-5-5", "claude-opus-5", "claude-sonnet-5-5", "claude-sonnet-5", "claude-haiku-4-5"];
 
 export const MODEL_IDS_IN_ORDER = ["claude-fable-5-1", "claude-fable-5", "claude-opus-5-5", "claude-opus-5", "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-5-5", "claude-sonnet-5", "claude-sonnet-4-6", "claude-haiku-4-5"];
 
