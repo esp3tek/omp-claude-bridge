@@ -13,6 +13,7 @@ const MODELS = [
 	{ id: "claude-sonnet-5-5", name: "Sonnet 5.5", contextWindow: 200_000 },
 	{ id: "claude-sonnet-5", name: "Sonnet 5", contextWindow: 200_000 },
 	{ id: "claude-sonnet-4-6", name: "Sonnet 4.6", contextWindow: 200_000 },
+	{ id: "claude-haiku-5-5", name: "Haiku 5.5", contextWindow: 1_000_000 },
 	{ id: "claude-haiku-4-5", name: "Haiku 4.5", contextWindow: 200_000 },
 ];
 
@@ -48,11 +49,15 @@ test("auto (Pro): each model expands to its available windows with correct ids, 
 	// Haiku 4.5: 200K only, no 1M variant.
 	assert.equal(m["claude-haiku-4-5"].contextWindow, 200_000);
 	assert.ok(!m["claude-haiku-4-5-1m"], "haiku has no 1M runtime");
+	// Haiku 5.5: the bare id serves 1M, no 200K variant.
+	assert.equal(m["claude-haiku-5-5"].contextWindow, 1_000_000);
+	assert.ok(!m["claude-haiku-5-5-200k"], "haiku-5-5 has no 200K runtime");
+	assert.ok(!m["claude-haiku-5-5-1m"]);
 });
 
-test("auto (Pro): 14 entries, and no base model emits two entries for the same window", () => {
+test("auto (Pro): 15 entries, and no base model emits two entries for the same window", () => {
 	const list = variants("auto");
-	assert.equal(list.length, 14);
+	assert.equal(list.length, 15);
 	for (const base of MODELS.map((mm) => mm.id)) {
 		const windows = list.filter((v) => parseVariantId(v.id).baseId === base).map((v) => v.contextWindow);
 		assert.equal(new Set(windows).size, windows.length, `${base} has duplicate windows`);
@@ -125,11 +130,14 @@ test("claudeCodeModelId: a suffixed id forces its window regardless of config", 
 test("explicit unavailable window suffixes are rejected", () => {
 	assert.throws(() => claudeCodeModelId({ id: "claude-haiku-4-5-1m" }, settings("auto")));
 	assert.throws(() => claudeCodeModelId({ id: "claude-opus-4-7-200k" }, settings("auto")));
+	assert.throws(() => claudeCodeModelId({ id: "claude-haiku-5-5-200k" }, settings("auto")));
 });
 
 test("unsuffixed models use their sole available window when the preference is unavailable", () => {
 	assert.equal(claudeCodeModelId({ id: "claude-haiku-4-5" }, settings("1m")), "claude-haiku-4-5");
 	assert.equal(claudeCodeModelId({ id: "claude-opus-4-7" }, settings("200k")), "claude-opus-4-7");
+	assert.equal(claudeCodeModelId({ id: "claude-haiku-5-5" }, settings("200k")), "claude-haiku-5-5");
+	assert.equal(claudeCodeModelId({ id: "claude-haiku-5-5" }, settings("1m")), "claude-haiku-5-5");
 });
 
 test("exact model ids win over earlier partial matches without changing family aliases", () => {
@@ -156,7 +164,7 @@ for (const contextWindow of ["auto", "1m", "200k"]) {
 				for (const entry of list) {
 					const runtimeId = claudeCodeModelId(entry, config);
 					const base = parseVariantId(entry.id).baseId;
-					const servedWindow = runtimeId.endsWith("[1m]") || base === "claude-opus-4-7" ? 1_000_000 : 200_000;
+					const servedWindow = runtimeId.endsWith("[1m]") || base === "claude-opus-4-7" || base === "claude-haiku-5-5" ? 1_000_000 : 200_000;
 					assert.equal(entry.contextWindow, servedWindow, entry.id);
 					assert.equal(runtimeId.replace(/\[1m\]$/, ""), base);
 					assert.equal(resolveModel(list, entry.id)?.id, entry.id);

@@ -15,9 +15,9 @@ export function registerDynamicWindows(id: string, caps: { oneM: boolean }): voi
 // before discovery, or discovery failing): the families the current Claude
 // Code picker offers. Everything in MODEL_IDS_IN_ORDER keeps its window policy
 // so it still works if discovery lists it or a role references it explicitly.
-export const STATIC_FALLBACK_IDS = ["claude-fable-5-1", "claude-opus-5-5", "claude-opus-5", "claude-sonnet-5-5", "claude-sonnet-5", "claude-haiku-4-5"];
+export const STATIC_FALLBACK_IDS = ["claude-fable-5-1", "claude-opus-5-5", "claude-opus-5", "claude-sonnet-5-5", "claude-sonnet-5", "claude-haiku-5-5", "claude-haiku-4-5"];
 
-export const MODEL_IDS_IN_ORDER = ["claude-fable-5-1", "claude-fable-5", "claude-opus-5-5", "claude-opus-5", "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-5-5", "claude-sonnet-5", "claude-sonnet-4-6", "claude-haiku-4-5"];
+export const MODEL_IDS_IN_ORDER = ["claude-fable-5-1", "claude-fable-5", "claude-opus-5-5", "claude-opus-5", "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-5-5", "claude-sonnet-5", "claude-sonnet-4-6", "claude-haiku-5-5", "claude-haiku-4-5"];
 
 // Workaround for models that ship without a thinkingLevelMap. Sonnet 5 and
 // Sonnet 4.6 have no map, so getSupportedThinkingLevels hides xhigh (it's
@@ -69,7 +69,8 @@ const ONE_M_CONTEXT = 1_000_000;
 
 // Measured Claude Agent SDK subscription/OAuth behavior. Do not infer this from
 // pi-ai's advertised contextWindow: bare Opus 4.7 serves 1M, bare Opus 4.8 does
-// not, bare Fable 5 serves 200K while claude-fable-5[1m] serves 1M, and [1m]
+// not, bare Fable 5 serves 200K while claude-fable-5[1m] serves 1M, bare Haiku
+// 5.5 serves 1M with no [1m] or 200K form in Claude Code's picker, and [1m]
 // entitlement differs by model. The default-window preference falls back to the
 // other supported window, using the same policy for registration and execution.
 export function resolveClaudeCodeRuntimeModel(modelId: string, settings: LongContextSettings): ClaudeCodeRuntimeModel | null {
@@ -113,6 +114,8 @@ function resolveAutoRuntimeModel(modelId: string, settings: LongContextSettings)
 				cliModelId: settings.longContextExtraUsage ? "claude-sonnet-4-6[1m]" : "claude-sonnet-4-6",
 				contextWindow: settings.longContextExtraUsage ? ONE_M_CONTEXT : TWO_HUNDRED_K_CONTEXT,
 			};
+		case "claude-haiku-5-5":
+			return { cliModelId: "claude-haiku-5-5", contextWindow: ONE_M_CONTEXT };
 		case "claude-haiku-4-5":
 			return { cliModelId: "claude-haiku-4-5", contextWindow: TWO_HUNDRED_K_CONTEXT };
 		default:
@@ -144,6 +147,8 @@ function resolveForcedOneMRuntimeModel(modelId: string): ClaudeCodeRuntimeModel 
 			return { cliModelId: "claude-sonnet-5[1m]", contextWindow: ONE_M_CONTEXT };
 		case "claude-sonnet-4-6":
 			return { cliModelId: "claude-sonnet-4-6[1m]", contextWindow: ONE_M_CONTEXT };
+		case "claude-haiku-5-5":
+			return { cliModelId: "claude-haiku-5-5", contextWindow: ONE_M_CONTEXT };
 		case "claude-haiku-4-5":
 			return null;
 		default: {
@@ -179,6 +184,8 @@ function resolveForcedTwoHundredKRuntimeModel(modelId: string): ClaudeCodeRuntim
 			return { cliModelId: "claude-sonnet-5", contextWindow: TWO_HUNDRED_K_CONTEXT };
 		case "claude-sonnet-4-6":
 			return { cliModelId: "claude-sonnet-4-6", contextWindow: TWO_HUNDRED_K_CONTEXT };
+		case "claude-haiku-5-5":
+			return null;
 		case "claude-haiku-4-5":
 			return { cliModelId: "claude-haiku-4-5", contextWindow: TWO_HUNDRED_K_CONTEXT };
 		default:

@@ -4,6 +4,17 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.18] - 2026-10-27
+
+### Added
+- Haiku 5.5 joins the static model list and the window tables. Claude Code
+  serves the bare `claude-haiku-5-5` id at 1M (measured: `contextWindow:
+  1000000`) and its picker offers no `[1m]` or 200K form, so it registers a
+  single 1M entry, like Opus 4.7. omp still caps the window it shows at the
+  catalog's long-context threshold (100K). Fallback chains and roles can now
+  name `claude-bridge/claude-haiku-5-5` without an unknown-model warning at
+  startup.
+
 ## [0.9.17] - 2026-10-26
 
 ### Added
