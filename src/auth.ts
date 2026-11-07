@@ -11,8 +11,8 @@ export function isAuthError(text: string, apiStatus?: number | null): boolean {
 }
 
 export const AUTH_ADVICE =
-	"Claude Code ha perdido la sesión (401). Abre una consola, ejecuta `claude` y escribe /login; " +
-	"después repite el turno. Reintentar sin iniciar sesión fallará igual.";
+	"Claude Code lost its login (401). Open a terminal, run `claude`, and type /login, " +
+	"then retry the turn. Retrying without logging in will fail the same way.";
 
 /** Thrown for a lost Claude Code login; `status` lets the host classify it as
  *  a 401 instead of a transient error it would retry. */
