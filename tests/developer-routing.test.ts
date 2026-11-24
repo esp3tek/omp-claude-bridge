@@ -420,7 +420,7 @@ test("a subagent's rejected developer push never marks its parent session", asyn
 	queries[0]!.close();
 });
 
-test("an unrelated orphan result never erases an active parent's answer", async () => {
+test("an unrelated aborted orphan result never erases an active parent's answer", async () => {
 	const parentStarted = new Deferred<undefined>();
 	runs.push(async function* ({ prompt }, query) {
 		if (typeof prompt !== "string") await prompt[Symbol.asyncIterator]().next();
@@ -431,7 +431,7 @@ test("an unrelated orphan result never erases an active parent's answer", async 
 	const parent = terminalEvent(T.streamClaudeAgentSdk(model, context([u("parent")]), { cwd: root }));
 	await parentStarted.promise;
 
-	const orphan = terminalEvent(T.streamClaudeAgentSdk(model, context([u("other"), a("foreign"), result("foreign")]), { cwd: root }));
+	const orphan = terminalEvent(T.streamClaudeAgentSdk(model, context([u("other"), a("foreign"), result("foreign")]), { cwd: root, signal: AbortSignal.abort() }));
 	await orphan.ended.promise;
 	expect(orphan.events.at(-1)).toMatchObject({ type: "done", message: { content: [] } });
 	expect(queryCalls).toHaveLength(1);
@@ -460,15 +460,11 @@ test("a next query keeps its active routing context while the prior query finali
 	await queries[1]!.closed.promise;
 });
 
-test("orphan result and developer shapes preserve end_turn; abort never starts a new query", async () => {
-	const noInput = terminalEvent(T.streamClaudeAgentSdk(model, context([u("initial"), a(), result()]), { cwd: root }));
-	await noInput.ended.promise;
-	expect(noInput.events.at(-1)).toMatchObject({ type: "done", reason: "stop" });
-	expect(queryCalls).toHaveLength(0);
-
+test("aborted orphan results and developer shapes never start a new query", async () => {
 	const aborted = new AbortController();
 	aborted.abort();
 	for (const messages of [
+		[u("initial"), a(), result()],
 		[u("initial"), a(), result(), d("developer after result")],
 		[u("initial"), a(), d("developer before result"), result()],
 		[u("initial"), a(), result(), d("")],
@@ -564,11 +560,12 @@ for (const developerFirst of [false, true]) {
 	});
 }
 
-test("an empty developer after an orphan result ends without starting a query", async () => {
+test("an empty developer after a resumed result does not suppress its continuation", async () => {
+	runs.push(successRun([]));
 	const stream = terminalEvent(T.streamClaudeAgentSdk(model, context([u("initial"), a(), result(), d("")]), { cwd: root }));
 	await stream.ended.promise;
 	expect(stream.events.at(-1)).toMatchObject({ type: "done", reason: "stop" });
-	expect(queryCalls).toHaveLength(0);
+	expect(queryCalls).toHaveLength(1);
 });
 
 test("side requests neither discard nor replace the main conversation's warm process", async () => {
@@ -2049,4 +2046,242 @@ test("late child shutdown cannot take ownership from a replacement extension mod
 	} finally {
 		nextT.clearSession();
 	}
+});
+
+// Regression cases adapted from pi-claude-bridge upstream recovery fixes.
+test("upstream regression: recover an SDK assistant retry after an interrupted stream", async () => {
+  runs.push(async function* ({ prompt }) {
+    if (typeof prompt !== "string") await prompt[Symbol.asyncIterator]().next();
+    yield { type: "stream_event", event: { type: "message_start", message: { id: "old", usage: {} } } };
+    yield { type: "stream_event", event: { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } } };
+    yield { type: "stream_event", event: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "abandoned" } } };
+    yield { type: "assistant", message: { id: "retry", content: [{ type: "text", text: "recovered answer" }] } };
+    yield { type: "result", subtype: "success", result: "recovered answer" };
+  });
+  const stream = terminalEvent(T.streamClaudeAgentSdk(model, context([u("hello")]), { cwd: root }));
+  await stream.ended.promise;
+  expect(JSON.stringify(stream.events.at(-1))).toContain("recovered answer");
+  expect(JSON.stringify(stream.events.at(-1))).not.toContain("abandoned");
+});
+
+test("upstream regression: tool result after a restart continues without a new user message", async () => {
+  let imported: ImportedSession | null = null;
+  const prompts: PromptMessage[] = [];
+  runs.push(async function* (args, query) {
+    imported = importedSession(args.options.resume);
+    yield* successRun(prompts)(args, query);
+  });
+  const stream = terminalEvent(T.streamClaudeAgentSdk(model, context([u("read then summarize"), a(), result()], [tool]), { cwd: root }));
+  await stream.ended.promise;
+  expect(queryCalls).toHaveLength(1);
+  expect(JSON.stringify(requireImported(imported).content)).toContain("tool result");
+  expect(promptText(prompts[0])).toContain("interrupted and resumed");
+});
+
+test("upstream regression: reasoning tokens use the SDK nested usage field", async () => {
+  runs.push(async function* ({ prompt }) {
+    if (typeof prompt !== "string") await prompt[Symbol.asyncIterator]().next();
+    yield { type: "assistant", message: { content: [{ type: "text", text: "done" }], usage: { input_tokens: 10, output_tokens: 30, output_tokens_details: { thinking_tokens: 20 } } } };
+    yield { type: "result", subtype: "success", result: "done" };
+  });
+  const stream = terminalEvent(T.streamClaudeAgentSdk(model, context([u("hello")]), { cwd: root }));
+  await stream.ended.promise;
+  expect(stream.events.at(-1)).toMatchObject({ message: { usage: { reasoning: 20 } } });
+  expect(stream.events.at(-1)).toMatchObject({ message: {
+    content: [{ type: "text", text: "done" }], usage: { output: 30, totalTokens: 40 },
+  } });
+});
+
+test("upstream regression: a query crash cannot mutate an already completed tool-use message", async () => {
+  const crash = new Deferred<undefined>();
+  runs.push(async function* ({ prompt }) {
+    if (typeof prompt !== "string") await prompt[Symbol.asyncIterator]().next();
+    yield { type: "assistant", message: { content: [{ type: "tool_use", id: "tool-1", name: "mcp__custom-tools__echo", input: {} }] } };
+    await crash.promise;
+    throw new Error("simulated SDK crash after tool dispatch");
+  });
+  const stream = terminalEvent(T.streamClaudeAgentSdk(model, context([u("hello")], [tool]), { cwd: root }));
+  await stream.ended.promise;
+  const event = stream.events.at(-1) as any;
+  expect(event.message.stopReason).toBe("toolUse");
+  crash.resolve(undefined);
+  await new Promise(resolve => setTimeout(resolve, 20));
+  expect(event.message.stopReason).toBe("toolUse");
+});
+
+test("upstream regression: the continuation signal aborts a parked SDK query", async () => {
+  const ready = new Deferred<undefined>();
+  runs.push(async function* ({ prompt, options }, query) {
+    if (typeof prompt !== "string") await prompt[Symbol.asyncIterator]().next();
+    yield { type: "assistant", message: { content: [{ type: "tool_use", id: "tool-1", name: "mcp__custom-tools__echo", input: {} }] } };
+    const pending = options.mcpServers!["custom-tools"].instance.tools[0].handler("tool-1");
+    ready.resolve(undefined);
+    await pending;
+    await query.closed.promise;
+  });
+  const first = terminalEvent(T.streamClaudeAgentSdk(model, context([u("hello")], [tool]), { cwd: root, signal: new AbortController().signal }));
+  await first.ended.promise;
+  await ready.promise;
+  const signal = new AbortController();
+  const second = terminalEvent(T.streamClaudeAgentSdk(model, context([u("hello"), a(), result()], [tool]), { cwd: root, signal: signal.signal }));
+  signal.abort();
+  const closed = await Promise.race([queries[0].closed.promise.then(() => true), new Promise(resolve => setTimeout(() => resolve(false), 100))]);
+  expect(closed).toBe(true);
+  await second.ended.promise;
+  expect(second.events.at(-1)).toMatchObject({ type: "error", reason: "aborted" });
+});
+
+const sdkEvent = (event: unknown) => ({ type: "stream_event", event });
+const sdkTool = (id: string) => ({ type: "assistant", message: {
+  id: `msg-${id}`, content: [{ type: "tool_use", id, name: "mcp__custom-tools__echo", input: {} }],
+} });
+
+for (const restream of [false, true]) {
+  test(`a cut stream recovers a tool and receives its result (restream=${restream})`, async () => {
+    const ready = new Deferred<undefined>();
+    let received: ToolResult | undefined;
+    runs.push(async function* ({ prompt, options }) {
+      if (typeof prompt !== "string") await prompt[Symbol.asyncIterator]().next();
+      yield sdkEvent({ type: "message_start", message: { id: "abandoned", usage: {} } });
+      yield sdkEvent({ type: "content_block_start", index: 0, content_block: { type: "thinking", thinking: "" } });
+      yield sdkEvent({ type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: "unsigned abandoned thought" } });
+      if (restream) {
+        yield sdkEvent({ type: "message_start", message: { id: "retry", usage: {} } });
+        yield sdkEvent({ type: "content_block_start", index: 0, content_block: {
+          type: "tool_use", id: "recovered", name: "mcp__custom-tools__echo", input: {},
+        } });
+        yield sdkEvent({ type: "content_block_stop", index: 0 });
+        yield sdkEvent({ type: "message_stop" });
+      } else yield sdkTool("recovered");
+      const pending = options.mcpServers!["custom-tools"].instance.tools[0].handler("recovered");
+      ready.resolve(undefined);
+      received = await pending;
+      yield { type: "result", subtype: "success", result: "continued" };
+    });
+    const first = terminalEvent(T.streamClaudeAgentSdk(model, context([u("start")], [tool]), { cwd: root }));
+    await first.ended.promise;
+    await ready.promise;
+    expect(first.events.at(-1)).toMatchObject({ type: "done", reason: "toolUse", message: {
+      content: [{ type: "toolCall", id: "recovered", name: "echo", arguments: {} }],
+    } });
+    const second = terminalEvent(T.streamClaudeAgentSdk(model, context([u("start"), a("recovered"), result("recovered")], [tool]), { cwd: root }));
+    await second.ended.promise;
+    expect(received?.content).toEqual([{ type: "text", text: "tool result" }]);
+    expect(second.events.at(-1)).toMatchObject({ type: "done", reason: "stop" });
+  });
+}
+
+test("a cut tool block is discarded while complete text and a later valid call survive", async () => {
+  runs.push(async function* ({ prompt }) {
+    if (typeof prompt !== "string") await prompt[Symbol.asyncIterator]().next();
+    yield sdkEvent({ type: "message_start", message: { id: "cut", usage: {} } });
+    yield sdkEvent({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } });
+    yield sdkEvent({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "complete text" } });
+    yield sdkEvent({ type: "content_block_stop", index: 0 });
+    yield sdkEvent({ type: "content_block_start", index: 1, content_block: {
+      type: "tool_use", id: "incomplete", name: "mcp__custom-tools__echo", input: {},
+    } });
+    yield sdkEvent({ type: "message_stop" });
+    yield sdkTool("valid");
+  });
+  const stream = terminalEvent(T.streamClaudeAgentSdk(model, context([u("start")], [tool]), { cwd: root }));
+  await stream.ended.promise;
+  expect(stream.events.at(-1)).toMatchObject({ type: "done", reason: "toolUse", message: { content: [
+    { type: "text", text: "complete text" }, { type: "toolCall", id: "valid" },
+  ] } });
+  expect(stream.events.filter((event: any) => event.type === "toolcall_end")).toHaveLength(1);
+});
+
+test("the SDK echo of a completed streamed message is not delivered twice", async () => {
+  runs.push(async function* ({ prompt }) {
+    if (typeof prompt !== "string") await prompt[Symbol.asyncIterator]().next();
+    yield sdkEvent({ type: "message_start", message: { id: "same", usage: {} } });
+    yield sdkEvent({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } });
+    yield sdkEvent({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "once" } });
+    yield sdkEvent({ type: "content_block_stop", index: 0 });
+    yield sdkEvent({ type: "message_stop" });
+    yield { type: "assistant", message: { id: "same", content: [{ type: "text", text: "once" }] } };
+    yield { type: "result", subtype: "success", result: "once" };
+  });
+  const stream = terminalEvent(T.streamClaudeAgentSdk(model, context([u("hello")]), { cwd: root }));
+  await stream.ended.promise;
+  expect(stream.events.at(-1)).toMatchObject({ message: { content: [{ type: "text", text: "once" }] } });
+});
+
+test("aborting a parked query preserves the completed tool-use message", async () => {
+  const controller = new AbortController();
+  runs.push(async function* ({ prompt }, query) {
+    if (typeof prompt !== "string") await prompt[Symbol.asyncIterator]().next();
+    yield sdkTool("parked");
+    await query.closed.promise;
+  });
+  const stream = terminalEvent(T.streamClaudeAgentSdk(model, context([u("hello")], [tool]), { cwd: root, signal: controller.signal }));
+  await stream.ended.promise;
+  const event = stream.events.at(-1) as any;
+  controller.abort();
+  await queries[0].closed.promise;
+  await new Promise<void>(resolve => setImmediate(resolve));
+  expect(event.message.stopReason).toBe("toolUse");
+  expect(event.message.errorMessage).toBeUndefined();
+});
+
+for (const alreadyAborted of [false, true]) {
+  test(`a continuation abort settles its stream even if the SDK throws (already=${alreadyAborted})`, async () => {
+    const ready = new Deferred<undefined>();
+    runs.push(async function* ({ prompt, options }, query) {
+      if (typeof prompt !== "string") await prompt[Symbol.asyncIterator]().next();
+      yield sdkTool("tool-1");
+      const pending = options.mcpServers!["custom-tools"].instance.tools[0].handler("tool-1");
+      ready.resolve(undefined);
+      await pending;
+      await query.closed.promise;
+      throw new Error("process closed");
+    });
+    const first = terminalEvent(T.streamClaudeAgentSdk(model, context([u("hello")], [tool]), { cwd: root }));
+    await first.ended.promise;
+    await ready.promise;
+    const controller = new AbortController();
+    if (alreadyAborted) controller.abort();
+    const second = terminalEvent(T.streamClaudeAgentSdk(model, context([u("hello"), a(), result()], [tool]), { cwd: root, signal: controller.signal }));
+    if (!alreadyAborted) controller.abort();
+    await second.ended.promise;
+    expect(second.events.at(-1)).toMatchObject({ type: "error", reason: "aborted", error: { stopReason: "aborted" } });
+  });
+}
+
+test("ended continuation signals cannot cancel the next run of the same query", async () => {
+  const ready = new Deferred<undefined>();
+  const readyAgain = new Deferred<undefined>();
+  let queryClosed = false;
+  runs.push(async function* ({ prompt, options }, query) {
+    void query.closed.promise.then(() => { queryClosed = true; });
+    if (typeof prompt !== "string") await prompt[Symbol.asyncIterator]().next();
+    const handler = options.mcpServers!["custom-tools"].instance.tools[0].handler;
+    yield sdkTool("first");
+    const firstResult = handler("first");
+    ready.resolve(undefined);
+    await firstResult;
+    yield sdkTool("second");
+    const secondResult = handler("second");
+    readyAgain.resolve(undefined);
+    await secondResult;
+    await query.closed.promise;
+  });
+  const first = terminalEvent(T.streamClaudeAgentSdk(model, context([u("start")], [tool]), { cwd: root }));
+  await first.ended.promise;
+  await ready.promise;
+  const older = new AbortController();
+  const history = [u("start"), a("first"), result("first")];
+  const second = terminalEvent(T.streamClaudeAgentSdk(model, context(history, [tool]), { cwd: root, signal: older.signal }));
+  await second.ended.promise;
+  await readyAgain.promise;
+  older.abort();
+  await new Promise<void>(resolve => setImmediate(resolve));
+  expect(queryClosed).toBe(false);
+  const current = new AbortController();
+  const third = terminalEvent(T.streamClaudeAgentSdk(model, context([...history, a("second"), result("second")], [tool]), { cwd: root, signal: current.signal }));
+  current.abort();
+  await third.ended.promise;
+  expect(queryClosed).toBe(true);
+  expect(third.events.at(-1)).toMatchObject({ type: "error", reason: "aborted" });
 });

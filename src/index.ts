@@ -963,13 +963,24 @@ function buildMcpServers(tools: Tool[], queryCtx: QueryContext, hasToolReference
 
 // --- Usage helpers ---
 
-function updateUsage(output: AssistantMessage, usage: Record<string, number | undefined>, model: Model<any>): void {
+interface SdkTokenUsage {
+	input_tokens?: number;
+	output_tokens?: number;
+	cache_read_input_tokens?: number;
+	cache_creation_input_tokens?: number;
+	output_tokens_details?: { thinking_tokens?: number | null } | null;
+	// Retain compatibility with older fixtures/SDKs that used flat fields.
+	reasoning_tokens?: number;
+	thinking_tokens?: number;
+}
+
+function updateUsage(output: AssistantMessage, usage: SdkTokenUsage, model: Model<any>): void {
 	if (usage.input_tokens != null) output.usage.input = usage.input_tokens;
 	if (usage.output_tokens != null) output.usage.output = usage.output_tokens;
 	if (usage.cache_read_input_tokens != null) output.usage.cacheRead = usage.cache_read_input_tokens;
 	if (usage.cache_creation_input_tokens != null) output.usage.cacheWrite = usage.cache_creation_input_tokens;
 	// Claude Code may report reasoning/thinking tokens separately, while pi's Usage type does not model that field.
-	const reasoning = usage.reasoning_tokens ?? usage.thinking_tokens;
+	const reasoning = usage.output_tokens_details?.thinking_tokens ?? usage.reasoning_tokens ?? usage.thinking_tokens;
 	if (reasoning != null) (output.usage as typeof output.usage & { reasoning?: number }).reasoning = reasoning;
 	output.usage.totalTokens = output.usage.input + output.usage.output + output.usage.cacheRead + output.usage.cacheWrite;
 	const catalog = getModels("anthropic");
@@ -1077,8 +1088,12 @@ function processStreamEvent(
 	const event = (message as SDKMessage & { event: any }).event;
 
 	if (event?.type === "message_start") {
+		if (c.turnStreamOpen) dropAbandonedStreamBlocks(c);
 		c.turnToolCallIds = [];
 		c.nextHandlerIdx = 0;
+		c.turnStreamMessageId = event.message?.id;
+		c.turnStreamOpen = true;
+		c.turnStreamBlockStart = c.turnBlocks.length;
 		if (event.message?.usage) updateUsage(c.turnOutput, event.message.usage, model);
 		return;
 	}
@@ -1102,7 +1117,6 @@ function processStreamEvent(
 				debug(`processStreamEvent: skipping tool_use for unserved tool ${event.content_block.name} [${event.content_block.id}] — CC rejects it and retries`);
 				return;
 			}
-			c.turnSawToolCall = true;
 			c.turnToolCallIds.push(event.content_block.id);
 			c.turnBlocks.push({
 				type: "toolCall", id: event.content_block.id,
@@ -1165,6 +1179,17 @@ function processStreamEvent(
 		return;
 	}
 
+	if (event?.type === "message_stop") {
+		// A cut stream may stop with a partial tool call or unsigned thinking.
+		// Keep closed blocks, but never dispatch a call CC itself discarded.
+		for (let i = c.turnBlocks.length - 1; i >= c.turnStreamBlockStart; i--) {
+			if (c.turnBlocks[i].index !== undefined) c.turnBlocks.splice(i, 1);
+		}
+		c.turnToolCallIds = c.turnBlocks.filter((b) => b.type === "toolCall").map((b) => b.id);
+		c.turnSawToolCall = c.turnToolCallIds.length > 0;
+		c.turnStreamOpen = false;
+	}
+
 	if (event?.type === "message_stop" && c.turnSawToolCall) {
 		// Tool call complete — end this OMP stream. The SDK will still yield an
 		// assistant message for this turn, but currentPiStream=null causes
@@ -1187,6 +1212,15 @@ function processStreamEvent(
 	}
 }
 
+// Ported from pi-claude-bridge: a retry replaces the abandoned SDK message,
+// while earlier complete messages in this host turn remain in the transcript.
+function dropAbandonedStreamBlocks(c: QueryContext): void {
+	c.turnBlocks.splice(c.turnStreamBlockStart);
+	c.turnToolCallIds = [];
+	c.turnSawToolCall = c.turnBlocks.some((b) => b.type === "toolCall");
+	c.turnStreamOpen = false;
+}
+
 // The SDK always yields `assistant` messages (completed content blocks) after streaming.
 // When stream_events already delivered the content, this is a no-op. But after
 // resetTurnState (e.g. tool result delivery), if the next turn's assistant message
@@ -1194,9 +1228,14 @@ function processStreamEvent(
 // the same stream lifecycle as processStreamEvent — including ending the stream on
 // tool_use to prevent deadlock with the MCP handler.
 function processAssistantMessage(message: SDKMessage, model: Model<any>, customToolNameToPi: Map<string, string>, c: QueryContext): void {
-	if (c.turnSawStreamEvent) return;
 	const assistantMsg = (message as any).message;
 	if (!assistantMsg?.content) return;
+	if (c.turnSawStreamEvent) {
+		// An echo of the streamed message is already delivered. A different id
+		// is Claude Code's non-streaming retry and must reach the host.
+		if (!assistantMsg.id || !c.turnStreamMessageId || assistantMsg.id === c.turnStreamMessageId) return;
+		if (c.turnStreamOpen) dropAbandonedStreamBlocks(c);
+	}
 	c.turnToolCallIds = [];
 	c.nextHandlerIdx = 0;
 	debug(`processAssistantMessage fallback: ${assistantMsg.content.length} blocks, types=${assistantMsg.content.map((b: any) => b.type).join(",")}`);
@@ -1317,7 +1356,7 @@ async function consumeQuery(
 					}
 					throw new Error(apiStatus ? `${apiStatus} ${text}` : String(text));
 				}
-				if (!queryCtx.turnSawStreamEvent && message.subtype === "success") {
+				if (!queryCtx.turnSawStreamEvent && queryCtx.turnBlocks.length === 0 && message.subtype === "success") {
 					ensureTurnStarted(queryCtx);
 					const text = message.result || "";
 					queryCtx.turnBlocks.push({ type: "text", text });
@@ -1651,6 +1690,8 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		for (const r of newResults) if (r.toolCallId) resultCtx.deliveredResultIds.add(r.toolCallId);
 		claimCurrentPiStream(stream, "tool-result", resultCtx);
 		resultCtx.resetTurnState(model);
+		resultCtx.bindRunSignal?.(options?.signal, stream);
+		if (options?.signal?.aborted) return stream;
 		// User messages (steer / followUp) omp injected into context during the
 		// active query — a steer typed while a tool ran, drained by omp at the
 		// turn boundary next to the tool result. Written to Claude Code's stdin
@@ -1679,11 +1720,12 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	}
 
 	// --- Orphaned tool result (e.g. user aborted a tool call) ---
-	// The query is gone but pi still delivered the result. Nothing to do — just
-	// emit end_turn so pi waits for the next real user message. Unless input is
-	// waiting next to the result (a reminder omp added before it): that goes to
-	// a fresh query, with the result rebuilt into history, instead of vanishing.
-	if (allResults.length > 0 && (pendingInput.blocks.length === 0 || options?.signal?.aborted)) {
+	// Only an aborted callback is discarded. After a crash/restart the result
+	// is real pending work: rebuild it into history and continue the task.
+	const completedReplay = !activeQuery && ctx().completedSuccessfully && sharedSession?.root !== undefined
+		&& sharedSession.root === historyRoot(context.messages) && pendingInput.blocks.length === 0
+		&& allResults.every((r) => r.toolCallId && ctx().deliveredResultIds.has(r.toolCallId));
+	if (allResults.length > 0 && (options?.signal?.aborted || completedReplay)) {
 		debug(`provider: orphaned tool result after abort, emitting end_turn`);
 		if (sharedSession && !activeQuery) {
 			if (pendingInput.blocks.length > 0) sharedSession = { ...sharedSession, needsRebuild: true };
@@ -1696,7 +1738,8 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		});
 		return stream;
 	}
-	return startFreshQuery(model, context, options, stream, pendingInput, isSideRequest, activeQuery, false);
+	return startFreshQuery(model, context, options, stream, pendingInput, isSideRequest, activeQuery, false,
+		allResults.length > 0 && pendingInput.blocks.length === 0);
 }
 
 /** Start either an ordinary turn or a compacted midturn continuation. */
@@ -1709,6 +1752,7 @@ function startFreshQuery(
 	isSideRequest: boolean,
 	activeQuery: boolean,
 	afterCompaction: boolean,
+	afterResume = false,
 ): AssistantMessageEventStream {
 	const lastMsg = context.messages[context.messages.length - 1];
 
@@ -1730,6 +1774,7 @@ function startFreshQuery(
 	// 2. Fresh child context — constructor already gave us clean Maps and empty
 	//    arrays. For a reused top-level context, clear explicitly.
 	claimCurrentPiStream(stream, "fresh-query", queryCtx);
+	queryCtx.completedSuccessfully = false;
 	queryCtx.pendingToolCalls.clear();
 	queryCtx.pendingResults.clear();
 	queryCtx.resetTurnState(model);
@@ -1739,9 +1784,9 @@ function startFreshQuery(
 	// id while the live query and its tool ids carry on.)
 	queryCtx.turnToolCallIds = [];
 	queryCtx.nextHandlerIdx = 0;
-	queryCtx.latestCursor = afterCompaction ? context.messages.length : 0;
+	queryCtx.latestCursor = afterCompaction || afterResume ? context.messages.length : 0;
 	queryCtx.deliveredResultIds.clear();
-	if (afterCompaction) {
+	if (afterCompaction || afterResume) {
 		for (const message of pendingInput.history) {
 			if (message.role === "toolResult" && message.toolCallId) queryCtx.deliveredResultIds.add(message.toolCallId);
 		}
@@ -1754,8 +1799,9 @@ function startFreshQuery(
 	const claudeDir = process.env.CLAUDE_CONFIG_DIR;
 	const parentSessionId = sharedSession?.sessionId;
 	const continuation = "Compaction finished. Continue the original unfinished work from the summary and recorded tool results. Honor any new instructions below. Do not redo completed tools or start a new handoff unless requested.";
-	const promptBlocks = afterCompaction
-		? [...promptMessageBlocks({ role: "developer", content: continuation }), ...pendingInput.blocks] as ContentBlockParam[]
+	const resumeContinuation = "Your session was interrupted and resumed. Continue the unfinished task from the recorded tool results. Do not redo completed tools. Honor any new instructions below.";
+	const promptBlocks = afterCompaction || afterResume
+		? [...promptMessageBlocks({ role: "developer", content: afterCompaction ? continuation : resumeContinuation }), ...pendingInput.blocks] as ContentBlockParam[]
 		: pendingInput.blocks.length ? (pendingInput.blocks as ContentBlockParam[]) : null;
 	let promptText = "";
 	if (pendingInput.pendingIndices.length > 1 || context.messages[pendingInput.pendingIndices[0]]?.role === "developer") {
@@ -1898,7 +1944,7 @@ function startFreshQuery(
 	let wasAborted = false;
 	let sdkQuery: Query;
 	try {
-		const syncResult = syncSharedSession(pendingInput.history as Context["messages"], cwd, customToolNameToSdk, model.id, isIsolated, afterCompaction || pendingInput.interleaved);
+		const syncResult = syncSharedSession(pendingInput.history as Context["messages"], cwd, customToolNameToSdk, model.id, isIsolated, afterCompaction || afterResume || pendingInput.interleaved);
 		resumeSessionId = syncResult.sessionId;
 		ownsSharedSession = !isIsolated && !syncResult.preserveSharedSession;
 		queryCtx.ownsSharedSession = ownsSharedSession;
@@ -1968,6 +2014,21 @@ function startFreshQuery(
 		else options.signal.addEventListener("abort", onAbort, { once: true });
 	}
 
+	// Later host runs can continue this parked query with a different signal.
+	// Retire the previous continuation listener, and ignore cancellation once
+	// that run's output stream has already ended at its next tool boundary.
+	let unbindRunSignal = () => {};
+	const bindRunSignal = (signal: AbortSignal | undefined, runStream: AssistantMessageEventStream) => {
+		unbindRunSignal();
+		unbindRunSignal = () => {};
+		if (!signal || signal === options?.signal) return;
+		const onRunAbort = () => { if (!completedStreams.has(runStream as object)) onAbort(); };
+		if (signal.aborted) return onRunAbort();
+		signal.addEventListener("abort", onRunAbort, { once: true });
+		unbindRunSignal = () => signal.removeEventListener("abort", onRunAbort);
+	};
+	queryCtx.bindRunSignal = bindRunSignal;
+
 	// Background consumer — runs until query ends
 	consumeQuery(sdkQuery, customToolNameToPi, model, () => wasAborted, queryCtx, (id) => { capturedSessionId = id; })
 		.finally(() => {
@@ -1987,7 +2048,7 @@ function startFreshQuery(
 				if (canUpdateSharedSession() && sharedSession) sharedSession = { ...sharedSession, needsRebuild: true, forceRotate: true };
 				if (canUpdateSharedSession()) interruptedPromptEnd = context.messages.length;
 				debug(`provider: abort detected${canUpdateSharedSession() ? ", marked sharedSession needsRebuild + forceRotate" : ", preserving sharedSession"}`);
-				if (queryCtx.turnOutput) {
+				if (queryCtx.turnOutput && queryCtx.currentPiStream) {
 					queryCtx.turnOutput.stopReason = "aborted";
 					queryCtx.turnOutput.errorMessage = "Operation aborted";
 				}
@@ -2023,6 +2084,7 @@ function startFreshQuery(
 				debug("provider: clearing activeQuery before final stream completion");
 				queryCtx.activeQuery = null;
 			}
+			queryCtx.completedSuccessfully = Boolean(queryCtx.currentPiStream);
 			finalizeCurrentStream(queryCtx, queryCtx.turnOutput?.stopReason);
 
 			// Pre-spawn the next process: same options, resuming the session this
@@ -2040,6 +2102,7 @@ function startFreshQuery(
 		})
 		.catch((error) => {
 			if (queryCtx.retired) return;
+			queryCtx.completedSuccessfully = false;
 			queryCtx.compactionPending = false;
 			debug(`provider: query error, model=${cliModel}, aborted=${Boolean(options?.signal?.aborted)}, error=`, error);
 			if (canUpdateSharedSession()) {
@@ -2051,11 +2114,11 @@ function startFreshQuery(
 					sharedSession = null;
 				}
 			}
-			if (queryCtx.turnOutput) {
-				queryCtx.turnOutput.stopReason = options?.signal?.aborted ? "aborted" : "error";
+			if (queryCtx.turnOutput && queryCtx.currentPiStream) {
+				queryCtx.turnOutput.stopReason = wasAborted || options?.signal?.aborted ? "aborted" : "error";
 				queryCtx.turnOutput.errorMessage = error instanceof Error ? error.message : String(error);
 				if (error instanceof ClaudeUsageLimitError || error instanceof ClaudeAuthError) queryCtx.turnOutput.errorStatus = error.status;
-				else if (!options?.signal?.aborted && isAuthError(queryCtx.turnOutput.errorMessage)) {
+				else if (!wasAborted && !options?.signal?.aborted && isAuthError(queryCtx.turnOutput.errorMessage)) {
 					// Login lost outside a result (the CLI exited before answering).
 					if (shouldNotifyAuth()) piUI?.notify(AUTH_ADVICE, "error");
 					queryCtx.turnOutput.errorMessage += `\n\n${AUTH_ADVICE}`;
@@ -2083,6 +2146,8 @@ function startFreshQuery(
 				if (wasAborted || options?.signal?.aborted) queryCtx.compactionPending = false;
 			}
 			if (options?.signal) options.signal.removeEventListener("abort", onAbort);
+			unbindRunSignal();
+			if (queryCtx.bindRunSignal === bindRunSignal) queryCtx.bindRunSignal = null;
 			if (queryCtx.activeQuery === sdkQuery) {
 				// Drain pending handlers for this query
 				for (const pending of queryCtx.pendingToolCalls.values()) { pending.resolve({ content: [{ type: "text", text: "Query ended" }] }); }
@@ -2289,6 +2354,7 @@ function clearSession(event = "test reset"): void {
 	sessionGeneration++;
 	sharedSession = null;
 	interruptedPromptEnd = -1;
+	ctx().completedSuccessfully = false;
 	for (const queryCtx of activeQueryContexts) queryCtx.ownsSharedSession = false;
 	discardWarm(event);
 }

@@ -20,6 +20,7 @@ export class QueryContext {
 	activeQuery: unknown | null = null;
 	currentPiStream: AssistantMessageEventStream | null = null;
 	latestCursor = 0;
+	completedSuccessfully = false;
 	// Tool results already handed to this query's MCP handlers. A repeated
 	// callback carries only these; a compacted context is shorter but new.
 	deliveredResultIds = new Set<string>();
@@ -30,6 +31,8 @@ export class QueryContext {
 	retired = false;
 	// Installed by the SDK query owner; compaction retires it synchronously.
 	retire: (() => void) | null = null;
+	// A parked SDK query can be continued by a new host run with its own signal.
+	bindRunSignal: ((signal: AbortSignal | undefined, stream: AssistantMessageEventStream) => void) | null = null;
 	// False for concurrent children and zero-history side requests.
 	ownsSharedSession = false;
 	pendingToolCalls = new Map<string, PendingToolCall>();
@@ -47,6 +50,9 @@ export class QueryContext {
 	turnStarted = false;
 	turnSawStreamEvent = false;
 	turnSawToolCall = false;
+	turnStreamMessageId: string | undefined;
+	turnStreamOpen = false;
+	turnStreamBlockStart = 0;
 
 	get turnBlocks(): Array<any> {
 		if (!this.turnOutput) throw new Error("turnBlocks accessed before resetTurnState");
@@ -64,6 +70,9 @@ export class QueryContext {
 		this.turnStarted = false;
 		this.turnSawStreamEvent = false;
 		this.turnSawToolCall = false;
+		this.turnStreamMessageId = undefined;
+		this.turnStreamOpen = false;
+		this.turnStreamBlockStart = 0;
 		// turnToolCallIds and nextHandlerIdx are NOT reset — they persist across
 		// tool-result delivery callbacks within the same assistant message.
 	}

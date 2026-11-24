@@ -4,6 +4,29 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- Recover Claude Code retries after a cut stream, including non-streaming
+  retries with a new message id. Remove abandoned blocks and incomplete tool
+  calls while retaining completed blocks; do not duplicate assistant/result echoes.
+- Resume tool results after a restart or lost query without requiring another
+  user message. Rebuild the recorded result into history, preserve aborted-call
+  handling, and suppress duplicate callbacks after a successful completion.
+- Bind each continuation run's abort signal to its parked SDK query. Ignore
+  signals belonging to completed continuations and remove listeners on teardown.
+- Preserve completed tool-use messages when their SDK query later fails or is
+  aborted, so subsequent provider switches do not inherit a rewritten message.
+- Read reasoning usage from `output_tokens_details.thinking_tokens`, without
+  counting it twice in output tokens or cost.
+
+Adapted from elidickinson/pi-claude-bridge (0.9.3 and unreleased fixes at
+`6aa276a`), retaining OMP's session ownership and compaction handling.
+
+### Tests
+- Regression coverage for stream retries, tool-result recovery, nested reasoning
+  usage, immutable completed messages and cancellation across continuation runs.
+
 ## [0.9.18] - 2026-10-27
 
 ### Added
