@@ -30,14 +30,31 @@ import { fetchClaudeCodeModels, toProviderModels } from "./claude-models.js";
 import { calculateUsageCost } from "./cost.js";
 import { withSafeSpawn } from "./safe-spawn.js";
 
-// omp >= 18.4 dropped modes/components/keybinding-hints; a static import made the whole
-// extension fail to load ("Cannot find package '@oh-my-pi/pi-coding-agent'"). Resolve it
-// lazily and degrade to the default expand key when the module is gone.
-let keyHint: (id: string, description: string) => string = (_id, description) => `Ctrl+O ${description}`;
+// The keybinding-hints module moved from pi-coding-agent/modes/components (omp < 18.4) to
+// pi-tui/chrome (omp >= 18.4). A static import of a missing path made the whole extension
+// fail to load, so resolve it lazily: new path first, then the old one. Use editorKey (plain
+// key text; the caller applies its own dim style) and fall back to the default expand key
+// when the module is gone or the action is unbound.
+type EditorKey = (action: string) => string;
+let editorKey: EditorKey | undefined;
 try {
-	const hints = await import("@oh-my-pi/pi-coding-agent/modes/components/keybinding-hints");
-	if (typeof hints.keyHint === "function") keyHint = hints.keyHint;
+	const hints = await import("@oh-my-pi/pi-tui/chrome/keybinding-hints");
+	if (typeof hints.editorKey === "function") editorKey = hints.editorKey as EditorKey;
 } catch {}
+if (!editorKey) {
+	try {
+		// @ts-ignore -- removed in omp 18.4; only present on older hosts.
+		const hints = await import("@oh-my-pi/pi-coding-agent/modes/components/keybinding-hints");
+		if (typeof hints.editorKey === "function") editorKey = hints.editorKey as EditorKey;
+	} catch {}
+}
+function keyHint(id: string, description: string): string {
+	let key = "";
+	try {
+		key = editorKey?.(id) ?? "";
+	} catch {}
+	return `${key || "Ctrl+O"} ${description}`;
+}
 
 // Compat (#2): use factory if available (pi-ai ≥0.66), else fall back to constructor (gsd-pi etc.)
 const _piAi = piAi as any;

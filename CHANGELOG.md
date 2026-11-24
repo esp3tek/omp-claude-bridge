@@ -6,7 +6,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.9.19] - 2026-11-24
+
+### Changed
+- Verified with omp 19.1.1. The dev dependencies on `@oh-my-pi/*` move to
+  `^19.1.1`, so `bun run typecheck` checks against the current host; the
+  peer range stays at `>=16.3.6`.
+
 ### Fixed
+- The "to expand" hint on long tool output shows the key bound to
+  `app.tools.expand` again. omp 18.4 moved keybinding-hints to
+  `@oh-my-pi/pi-tui/chrome/keybinding-hints`; since then the lazy import of the
+  old path failed silently and the hint always read Ctrl+O. The bridge now tries
+  the new path first, then the old one, and keeps Ctrl+O when neither resolves
+  or the action is unbound.
 - Recover Claude Code retries after a cut stream, including non-streaming
   retries with a new message id. Remove abandoned blocks and incomplete tool
   calls while retaining completed blocks; do not duplicate assistant/result echoes.
