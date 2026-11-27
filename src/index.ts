@@ -6,7 +6,7 @@ import type { CompactionEntry } from "@oh-my-pi/pi-coding-agent/session/session-
 import { compact } from "@oh-my-pi/pi-agent-core/compaction";
 import { query, startup, type EffortLevel, type Query, type SDKMessage, type SDKUserMessage, type SettingSource, type WarmQuery } from "@anthropic-ai/claude-agent-sdk";
 import type { ContentBlockParam, MessageParam } from "@anthropic-ai/sdk/resources";
-import { Text } from "@oh-my-pi/pi-tui";
+import { textRows } from "./render-rows.js";
 import { createSession, deleteSession, repairToolPairing } from "cc-session-io";
 import { appendFileSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from "fs";
 import { homedir } from "os";
@@ -30,22 +30,30 @@ import { fetchClaudeCodeModels, toProviderModels } from "./claude-models.js";
 import { calculateUsageCost } from "./cost.js";
 import { withSafeSpawn } from "./safe-spawn.js";
 
-// The keybinding-hints module moved from pi-coding-agent/modes/components (omp < 18.4) to
-// pi-tui/chrome (omp >= 18.4). A static import of a missing path made the whole extension
-// fail to load, so resolve it lazily: new path first, then the old one. Use editorKey (plain
-// key text; the caller applies its own dim style) and fall back to the default expand key
-// when the module is gone or the action is unbound.
+// The helper that formats the key bound to an action keeps moving between omp releases:
+//   omp >= 19.2   pi-coding-agent/ui/keys/hints        actionKey
+//   omp 18.4–19.1 pi-tui/chrome/keybinding-hints       editorKey
+//   omp < 18.4    pi-coding-agent/modes/components/keybinding-hints  editorKey
+// A static import of a missing path makes the whole extension fail to load, so resolve it
+// lazily, newest first. Both return plain key text (the caller applies its own dim style);
+// fall back to the default expand key when none resolves or the action is unbound.
 type EditorKey = (action: string) => string;
+const pickKeyFn = (mod: Record<string, unknown>, name: string): EditorKey | undefined =>
+	typeof mod[name] === "function" ? (mod[name] as EditorKey) : undefined;
 let editorKey: EditorKey | undefined;
 try {
-	const hints = await import("@oh-my-pi/pi-tui/chrome/keybinding-hints");
-	if (typeof hints.editorKey === "function") editorKey = hints.editorKey as EditorKey;
+	editorKey = pickKeyFn(await import("@oh-my-pi/pi-coding-agent/ui/keys/hints"), "actionKey");
 } catch {}
 if (!editorKey) {
 	try {
-		// @ts-ignore -- removed in omp 18.4; only present on older hosts.
-		const hints = await import("@oh-my-pi/pi-coding-agent/modes/components/keybinding-hints");
-		if (typeof hints.editorKey === "function") editorKey = hints.editorKey as EditorKey;
+		// @ts-ignore -- omp 18.4–19.1 only.
+		editorKey = pickKeyFn(await import("@oh-my-pi/pi-tui/chrome/keybinding-hints"), "editorKey");
+	} catch {}
+}
+if (!editorKey) {
+	try {
+		// @ts-ignore -- omp < 18.4 only.
+		editorKey = pickKeyFn(await import("@oh-my-pi/pi-coding-agent/modes/components/keybinding-hints"), "editorKey");
 	} catch {}
 }
 function keyHint(id: string, description: string): string {
@@ -2686,12 +2694,12 @@ export default function (pi: ExtensionAPI) {
 				const lines = truncated.split("\n").slice(0, PREVIEW_MAX_LINES);
 				text += theme.fg("muted", `"${lines.join("\n")}"`);
 				if (params.prompt.length > PREVIEW_MAX_CHARS || params.prompt.split("\n").length > PREVIEW_MAX_LINES) text += theme.fg("dim", " …");
-				return new Text(text, 0, 0);
+				return textRows(text);
 			},
 			renderResult(result, { expanded, isPartial }, theme) {
 				if (isPartial) {
 					const status = result.content[0]?.type === "text" ? result.content[0].text : "working...";
-					return new Text(theme.fg("mdLink", "◉ Claude Code ") + theme.fg("muted", status), 0, 0);
+					return textRows(theme.fg("mdLink", "◉ Claude Code ") + theme.fg("muted", status));
 				}
 
 				const details = result.details as { prompt?: string; executionTime?: number; actions?: string; error?: boolean } | undefined;
@@ -2716,7 +2724,7 @@ export default function (pi: ExtensionAPI) {
 
 				}
 
-				return new Text(text, 0, 0);
+				return textRows(text);
 			},
 			async execute(_id, params, signal, onUpdate, ctx) {
 				// Guard: circular delegation

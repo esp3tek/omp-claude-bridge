@@ -6,6 +6,27 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.9.20] - 2026-11-27
+
+### Fixed
+- The extension loads again on omp 19.2. omp 19.2.0 rebuilt extension rendering on
+  the host pi-tui and dropped the `Text` component the AskClaude renderers
+  imported from `@oh-my-pi/pi-tui` ("Export named 'Text' not found"), so the
+  provider never registered and every `claude-bridge/*` entry in
+  `retry.fallbackChains` was reported as an unknown model. The renderers now
+  return a plain rows object (`render(width)` with ANSI-aware word wrap, no
+  pi-tui import), which both omp 19.2 and older hosts accept.
+- The expand hint finds the bound key on omp 19.2, where the helper moved to
+  `@oh-my-pi/pi-coding-agent/ui/keys/hints` (`actionKey`); the 18.4–19.1 and
+  older paths stay as fallbacks.
+
+### Changed
+- Dev dependencies on `@oh-my-pi/*` move to `^19.2.1`.
+
+### Tests
+- Word wrap of styled rows: word breaks, hard splits, zero-width escapes,
+  style reopened after a break, wide characters.
+
 ## [0.9.19] - 2026-11-24
 
 ### Changed
